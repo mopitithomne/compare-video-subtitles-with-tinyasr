@@ -1,0 +1,17 @@
+services:
+  telegram-asr-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BOT_DATABASE_PATH: /app/data/bot.sqlite3
+      BOT_REPORTS_PATH: /app/data/reports
+      TINYASR_PROFILE_DIR: /app/data/tinyasr-profile
+      YTDLP_COOKIES_FILE: ${YTDLP_COOKIES_FILE:-}
+    volumes:
+      - bot-data:/app/data
+      - ./secrets:/app/secrets
+
+volumes:
+  bot-data:

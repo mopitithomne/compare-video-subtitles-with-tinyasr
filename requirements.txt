@@ -1,0 +1,6 @@
+jiwer>=4,<5
+playwright>=1.50,<2
+python-dotenv>=1,<2
+pysrt>=1.1.2,<2
+yt-dlp>=2025.1.15
+yt-dlp-ejs>=0.8,<1
