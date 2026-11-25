@@ -14,7 +14,14 @@ class TinyASRError(RuntimeError):
     pass
 
 
-def transcribe(audio_path, model_label, language_code, progress_callback=None):
+def transcribe(
+    audio_path,
+    model_label,
+    language_code,
+    progress_callback=None,
+    auto_detect=False,
+    transcript_callback=None,
+):
     audio_path = Path(audio_path).resolve()
     profile_dir = Path(
         os.environ.get(
@@ -58,33 +65,53 @@ def transcribe(audio_path, model_label, language_code, progress_callback=None):
             else:
                 raise TinyASRError('TinyASR did not become ready within 10 minutes.')
 
-            logger.info(
-                'TinyASR is ready; selecting model %s and language %s.',
-                model_label,
-                language_code,
-            )
+            if auto_detect:
+                logger.info('TinyASR is ready; enabling automatic language detection.')
+            else:
+                logger.info(
+                    'TinyASR is ready; selecting model %s and language %s.',
+                    model_label,
+                    language_code,
+                )
             if progress_callback is not None:
                 progress_callback('Step 3/5: Transcribing audio with TinyASR...')
-            page.locator('#model').select_option(label=model_label)
-            page.locator('#lang').select_option(language_code)
+            if auto_detect:
+                page.locator('#model').select_option('auto')
+            else:
+                page.locator('#model').select_option(label=model_label)
+                page.locator('#lang').select_option(language_code)
             logger.info('Submitting audio to TinyASR.')
             page.locator('#file').set_input_files(str(audio_path))
 
             deadline = time.monotonic() + 1_800
             transcription_started_at = time.monotonic()
             next_transcription_progress = transcription_started_at + 60
+            streaming = transcript_callback is not None
+            last_transcript = None
             while time.monotonic() < deadline:
                 status = page.locator('#status').inner_text().strip()
-                if status.startswith('Done ('):
+                if status.startswith(('Done (', 'Done:')):
                     transcript = page.locator('#out').inner_text().strip()
                     if not transcript:
                         raise TinyASRError('TinyASR returned an empty transcript.')
+                    if streaming and transcript != last_transcript:
+                        streaming = transcript_callback(transcript) is not False
                     logger.info('TinyASR transcription completed.')
                     return transcript
                 if status.startswith(
                     ('Error:', 'Failed to start:', 'Could not decode')
                 ):
                     raise TinyASRError(f'TinyASR transcription failed: {status}')
+
+                transcript = page.locator('#out').inner_text().strip()
+                if (
+                    streaming
+                    and transcript
+                    and not transcript.startswith('Transcript appears here.')
+                    and transcript != last_transcript
+                ):
+                    last_transcript = transcript
+                    streaming = transcript_callback(transcript) is not False
 
                 download_status = page.locator('#dl')
                 if download_status.is_visible():

@@ -1,4 +1,6 @@
+import json
 import logging
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -231,7 +233,13 @@ def _telegram_audio_file(audio_path, output_dir):
     return compressed_path, True
 
 
-def process_video(url, track, output_dir, progress_callback=None):
+def process_video(
+    url,
+    track,
+    output_dir,
+    progress_callback=None,
+    transcript_callback=None,
+):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     audio_path, subtitle_path, title = _download_inputs(url, track, output_dir)
@@ -250,6 +258,7 @@ def process_video(url, track, output_dir, progress_callback=None):
         track['model_label'],
         track['model_language_code'],
         progress_callback,
+        transcript_callback=transcript_callback,
     )
     logger.info('TinyASR transcription completed.')
     transcript_path = output_dir / 'tinyasr-transcript.txt'
@@ -288,3 +297,144 @@ def process_video(url, track, output_dir, progress_callback=None):
         'audio_converted': audio_converted,
         **scores,
     }
+
+
+def _transcribe_uploaded_media(
+    media_path,
+    output_dir,
+    media_type,
+    progress_callback=None,
+    transcript_callback=None,
+):
+    media_label = 'audio file' if media_type == 'audio' else 'video'
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if progress_callback is not None:
+        progress_callback(
+            'Preparing uploaded audio for TinyASR...'
+            if media_type == 'audio'
+            else 'Extracting audio from the uploaded video...'
+        )
+    try:
+        probe = subprocess.run(
+            [
+                'ffprobe',
+                '-v',
+                'error',
+                '-show_entries',
+                'format=duration:stream=codec_type',
+                '-of',
+                'json',
+                str(media_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        raise RuntimeError('FFprobe is required to inspect uploaded media.') from None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        raise ValueError(f'The uploaded {media_label} is not readable.') from None
+    try:
+        probe_data = json.loads(probe.stdout)
+        duration = float(probe_data['format']['duration'])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError(f'Could not determine the uploaded {media_label} duration.') from None
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError(f'Could not determine the uploaded {media_label} duration.')
+    if duration > MAX_VIDEO_SECONDS:
+        raise ValueError('Uploaded media is limited to 60 minutes.')
+    streams = probe_data.get('streams')
+    if not isinstance(streams, list) or not any(
+        stream.get('codec_type') == 'audio'
+        for stream in streams
+        if isinstance(stream, dict)
+    ):
+        raise ValueError(f'The uploaded {media_label} does not contain an audio track.')
+
+    audio_filename = (
+        'uploaded-video-audio.mp3'
+        if media_type == 'video'
+        else 'uploaded-audio.mp3'
+    )
+    audio_path = output_dir / audio_filename
+    try:
+        subprocess.run(
+            [
+                'ffmpeg',
+                '-nostdin',
+                '-y',
+                '-v',
+                'error',
+                '-i',
+                str(media_path),
+                '-map',
+                '0:a:0',
+                '-vn',
+                '-ac',
+                '1',
+                '-ar',
+                '16000',
+                '-b:a',
+                '64k',
+                '-f',
+                'mp3',
+                str(audio_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=600,
+        )
+    except FileNotFoundError:
+        raise RuntimeError('FFmpeg is required to prepare audio for transcription.') from None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        raise RuntimeError('Could not prepare audio from the uploaded media.') from None
+
+    if progress_callback is not None:
+        progress_callback(
+            f'Transcribing the uploaded {media_label} with TinyASR...'
+        )
+    transcript = transcribe(
+        audio_path,
+        None,
+        None,
+        progress_callback,
+        auto_detect=True,
+        transcript_callback=transcript_callback,
+    )
+    transcript_path = output_dir / 'tinyasr-transcript.txt'
+    transcript_path.write_text(transcript + '\n', encoding='utf-8')
+    return transcript_path
+
+
+def transcribe_uploaded_video(
+    video_path,
+    output_dir,
+    progress_callback=None,
+    transcript_callback=None,
+):
+    return _transcribe_uploaded_media(
+        video_path,
+        output_dir,
+        'video',
+        progress_callback,
+        transcript_callback,
+    )
+
+
+def transcribe_uploaded_audio(
+    audio_path,
+    output_dir,
+    progress_callback=None,
+    transcript_callback=None,
+):
+    return _transcribe_uploaded_media(
+        audio_path,
+        output_dir,
+        'audio',
+        progress_callback,
+        transcript_callback,
+    )

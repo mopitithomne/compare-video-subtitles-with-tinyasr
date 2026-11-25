@@ -14,11 +14,18 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 
-from pipeline import AudioLanguageError, inspect_video, process_video
+from pipeline import (
+    AudioLanguageError,
+    inspect_video,
+    process_video,
+    transcribe_uploaded_audio,
+    transcribe_uploaded_video,
+)
 from validation import youtube_video_id
 
 
@@ -32,9 +39,12 @@ logger = logging.getLogger('telegram_asr_bot')
 _JOB_ID_RE = re.compile(r'^[a-f0-9]{32}$')
 _MAX_WAITING_USERS = 3
 _ACTIVE_JOB_STATUSES = ('discovering', 'awaiting_language', 'queued', 'processing')
+_QUEUE_JOB_STATUSES = ('discovering', 'queued', 'processing')
 _REPLACEABLE_JOB_STATUSES = ('discovering', 'awaiting_language', 'queued')
 _MAX_RICH_TABLE_ROWS = 450
 _MAX_RICH_TABLE_TEXT_BYTES = 28_000
+_MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
+_TRANSCRIPT_MESSAGE_CHARS = 3_900
 _store = None
 _executor = None
 _store_lock = threading.RLock()
@@ -85,6 +95,8 @@ class JobStore:
                     duration REAL,
                     tracks TEXT,
                     selected_track TEXT,
+                    source_type TEXT NOT NULL DEFAULT 'youtube',
+                    telegram_file_id TEXT,
                     error_code TEXT,
                     wer REAL,
                     cer REAL,
@@ -94,6 +106,18 @@ class JobStore:
                 )
                 '''
             )
+            job_columns = {
+                row['name']
+                for row in self.connection.execute('PRAGMA table_info(jobs)')
+            }
+            if 'source_type' not in job_columns:
+                self.connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN source_type TEXT NOT NULL DEFAULT 'youtube'"
+                )
+            if 'telegram_file_id' not in job_columns:
+                self.connection.execute(
+                    'ALTER TABLE jobs ADD COLUMN telegram_file_id TEXT'
+                )
             self.connection.execute(
                 '''
                 CREATE TABLE IF NOT EXISTS reports (
@@ -170,7 +194,22 @@ class JobStore:
             )
             self.connection.commit()
 
-    def create_job(self, update_id, youtube_url, user_id, chat_id):
+    def create_job(
+        self,
+        update_id,
+        youtube_url,
+        user_id,
+        chat_id,
+        source_type='youtube',
+        telegram_file_id=None,
+        selected_track=None,
+    ):
+        if source_type not in {'youtube', 'telegram', 'telegram_audio'}:
+            raise ValueError('Unsupported job source.')
+        if source_type in {'telegram', 'telegram_audio'} and not isinstance(
+            telegram_file_id, str
+        ):
+            raise ValueError('Telegram media jobs require a file ID.')
         job_id = uuid.uuid5(
             uuid.NAMESPACE_URL,
             f'telegram-bot-api:{update_id}',
@@ -243,10 +282,27 @@ class JobStore:
                     '''
                     INSERT INTO jobs
                         (job_id, update_id, youtube_url, user_id, chat_id, status,
+                         source_type, telegram_file_id, selected_track,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'discovering', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''',
-                    (job_id, update_id, youtube_url, user_id, chat_id, now, now),
+                    (
+                        job_id,
+                        update_id,
+                        youtube_url,
+                        user_id,
+                        chat_id,
+                        'queued' if source_type.startswith('telegram') else 'discovering',
+                        source_type,
+                        telegram_file_id,
+                        (
+                            json.dumps(selected_track, ensure_ascii=False)
+                            if selected_track is not None
+                            else None
+                        ),
+                        now,
+                        now,
+                    ),
                 )
                 self.connection.commit()
             except Exception:
@@ -313,13 +369,38 @@ class JobStore:
         with self.lock:
             rows = self.connection.execute(
                 f'''
-                SELECT job_id, status FROM jobs
+                SELECT job_id, status, source_type FROM jobs
                 WHERE status IN ({', '.join('?' for _ in _ACTIVE_JOB_STATUSES)})
                 ORDER BY created_at ASC, rowid ASC
                 ''',
                 _ACTIVE_JOB_STATUSES,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def queue_position(self, job_id):
+        with self.lock:
+            jobs = self.connection.execute(
+                f'''
+                SELECT job_id, status FROM jobs
+                WHERE status IN ({', '.join('?' for _ in _QUEUE_JOB_STATUSES)})
+                ORDER BY CASE status WHEN 'processing' THEN 0 ELSE 1 END,
+                         updated_at ASC, rowid ASC
+                ''',
+                _QUEUE_JOB_STATUSES,
+            ).fetchall()
+        for index, job in enumerate(jobs):
+            if job['job_id'] == job_id:
+                processing = sum(
+                    active_job['status'] == 'processing'
+                    for active_job in jobs
+                )
+                return {
+                    'position': index + 1,
+                    'ahead': index,
+                    'active': len(jobs),
+                    'processing': processing,
+                }
+        return None
 
     def save_report(self, report, user_id):
         with self.lock:
@@ -604,6 +685,142 @@ def _send_message(chat_id, text, reply_markup=None):
     return _telegram_call('sendMessage', payload)
 
 
+def _queue_status_message(job_id):
+    status = _get_store().queue_position(job_id)
+    if status is None:
+        return 'Queue position is no longer available; your request may have started.'
+    request_label = 'media request' if status['active'] == 1 else 'media requests'
+    processing_label = 'request is' if status['processing'] == 1 else 'requests are'
+    ahead_label = 'request' if status['ahead'] == 1 else 'requests'
+    return (
+        f"Queue estimate: {status['active']} active {request_label}; "
+        f"{status['processing']} {processing_label} processing. "
+        f"Your position is {status['position']}/{status['active']} "
+        f"({status['ahead']} {ahead_label} ahead)."
+    )
+
+
+def _transcript_draft_callback(chat_id):
+    draft_id = uuid.uuid4().int % 2_147_483_647 + 1
+    active = True
+    last_text = None
+
+    def update_draft(text):
+        nonlocal active, last_text
+        if not active:
+            return False
+        display_text = text[:4_096]
+        if display_text == last_text:
+            return True
+        try:
+            _telegram_call(
+                'sendMessageDraft',
+                {
+                    'chat_id': chat_id,
+                    'draft_id': draft_id,
+                    'text': display_text,
+                },
+            )
+        except RuntimeError:
+            logger.exception('Could not stream TinyASR draft in chat %s.', chat_id)
+            active = False
+            return False
+        last_text = display_text
+        return True
+
+    return update_draft
+
+
+def _download_telegram_media(file_id, output_dir, media_type):
+    media_label = 'audio file' if media_type == 'audio' else 'video'
+    size_error = f'Telegram {media_label}s larger than 20 MB cannot be downloaded.'
+    file_info = _telegram_call('getFile', {'file_id': file_id})
+    if not isinstance(file_info, dict):
+        raise RuntimeError(f'Telegram did not return {media_label} metadata.')
+    file_path = file_info.get('file_path')
+    file_size = file_info.get('file_size')
+    if file_size is not None and (
+        isinstance(file_size, bool)
+        or not isinstance(file_size, int)
+        or file_size <= 0
+    ):
+        raise RuntimeError('Telegram returned an invalid media file size.')
+    if file_size is not None and file_size > _MAX_TELEGRAM_DOWNLOAD_BYTES:
+        raise ValueError(size_error)
+    if not isinstance(file_path, str) or not file_path:
+        article = 'an' if media_type == 'audio' else 'a'
+        raise RuntimeError(
+            f'Telegram did not return {article} {media_label} download path.'
+        )
+    remote_path = PurePosixPath(file_path)
+    if remote_path.is_absolute() or any(
+        part in {'.', '..'} for part in remote_path.parts
+    ):
+        raise RuntimeError('Telegram returned an invalid media download path.')
+
+    suffix = remote_path.suffix
+    if not re.fullmatch(r'\.[A-Za-z0-9]{1,10}', suffix):
+        suffix = '.ogg' if media_type == 'audio' else '.mp4'
+    media_path = Path(output_dir) / f'telegram-{media_type}{suffix.casefold()}'
+    token = _required_environment('TELEGRAM_BOT_TOKEN')
+    request = urllib.request.Request(
+        f'https://api.telegram.org/file/bot{token}/{quote(file_path, safe="/")}',
+        method='GET',
+    )
+    downloaded = 0
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            response_size = response.headers.get('Content-Length')
+            if response_size is not None:
+                try:
+                    response_size = int(response_size)
+                except ValueError:
+                    raise RuntimeError(
+                        'Telegram returned an invalid media response size.'
+                    ) from None
+                if response_size > _MAX_TELEGRAM_DOWNLOAD_BYTES:
+                    raise ValueError(size_error)
+            with media_path.open('wb') as media_file:
+                while chunk := response.read(1024 * 1024):
+                    downloaded += len(chunk)
+                    if downloaded > _MAX_TELEGRAM_DOWNLOAD_BYTES:
+                        raise ValueError(size_error)
+                    media_file.write(chunk)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f'Telegram media download returned HTTP {error.code}.'
+        ) from None
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f'Telegram media download failed: {error.reason}.'
+        ) from None
+    if downloaded == 0:
+        raise RuntimeError('Telegram returned an empty media file.')
+    if file_size is not None and downloaded != file_size:
+        raise RuntimeError('The downloaded size did not match Telegram metadata.')
+    return media_path
+
+
+def _download_telegram_video(file_id, output_dir):
+    return _download_telegram_media(file_id, output_dir, 'video')
+
+
+def _download_telegram_audio(file_id, output_dir):
+    return _download_telegram_media(file_id, output_dir, 'audio')
+
+
+def _send_transcript(chat_id, transcript):
+    chunks = [
+        transcript[index:index + _TRANSCRIPT_MESSAGE_CHARS]
+        for index in range(0, len(transcript), _TRANSCRIPT_MESSAGE_CHARS)
+    ]
+    for index, chunk in enumerate(chunks, start=1):
+        heading = 'Transcript:\n\n'
+        if len(chunks) > 1:
+            heading = f'Transcript - part {index}/{len(chunks)}:\n\n'
+        _send_message(chat_id, heading + chunk)
+
+
 def _rich_text_parts(parts, style):
     rich_parts = []
     for part in parts:
@@ -763,7 +980,10 @@ def _send_audio(chat_id, audio_path, title):
     result = _upload_multipart(
         'sendAudio',
         chat_id,
-        [('title', title)],
+        [
+            ('title', title),
+            ('caption', 'Extracted audio file'),
+        ],
         [('audio', audio_path)],
     )
     if not isinstance(result, dict):
@@ -838,7 +1058,7 @@ def _report_details_keyboard(report_id):
     return {
         'inline_keyboard': [[
             {
-                'text': 'Voir les autres informations',
+                'text': 'View additional details',
                 'callback_data': f'details|{report_id}',
             }
         ]]
@@ -917,7 +1137,7 @@ def _send_saved_report(chat_id, report):
     _send_document(
         chat_id,
         html_path,
-        'HTML comparison report',
+        'Open to see the differences',
         _report_details_keyboard(report['report_id']),
     )
 
@@ -1039,6 +1259,18 @@ def _fail_job(
     _send_message(job['chat_id'], message)
 
 
+def _log_job_completion(job_id, task_description):
+    remaining_jobs = len(_get_store().active_jobs())
+    logger.info(
+        '%s completed for job %s; %d active job(s) remain.',
+        task_description,
+        job_id,
+        remaining_jobs,
+    )
+    if remaining_jobs == 0:
+        logger.info('No active video jobs remain; the bot can be safely restarted.')
+
+
 def _language_keyboard(job_id, tracks):
     return {
         'inline_keyboard': [
@@ -1141,6 +1373,7 @@ def _discover_job(job_id):
                 job['chat_id'],
                 f"Only one compatible subtitle language is available: "
                 f"{track['language_name']}.\n\n"
+                f"{_queue_status_message(job_id)}\n\n"
                 'Step 1/5: Preparing to download audio and subtitles...',
             )
         finally:
@@ -1185,11 +1418,17 @@ def _process_job(job_id, progress_callback=None):
         progress_callback('Step 1/5: Downloading audio and selected subtitles...')
     try:
         with tempfile.TemporaryDirectory(prefix='telegram-asr-') as output_dir:
+            transcript_callback = (
+                _transcript_draft_callback(job['chat_id'])
+                if job['chat_id'] > 0
+                else None
+            )
             result = process_video(
                 job['youtube_url'],
                 track,
                 output_dir,
                 progress_callback,
+                transcript_callback=transcript_callback,
             )
             source_label = 'manual' if track['source'] == 'manual' else 'automatic'
             display_title = result['title'][:180]
@@ -1220,7 +1459,7 @@ def _process_job(job_id, progress_callback=None):
             _send_document(
                 job['chat_id'],
                 result['differences_html_path'],
-                'HTML comparison report',
+                'Open to see the differences',
                 _report_details_keyboard(report['report_id']),
             )
     except Exception as error:
@@ -1242,7 +1481,7 @@ def _process_job(job_id, progress_callback=None):
         )
         return
 
-    _get_store().update_job(
+    completed = _get_store().update_job(
         job_id,
         status='completed',
         title=result['title'],
@@ -1253,6 +1492,105 @@ def _process_job(job_id, progress_callback=None):
     completion_message = 'Comparison complete. Your audio and HTML report are attached.'
     if progress_callback is not None and not progress_callback(completion_message):
         _send_message(job['chat_id'], completion_message)
+    if completed:
+        _log_job_completion(job_id, 'Video comparison')
+
+
+def _process_telegram_upload_job(job_id, media_type, progress_callback=None):
+    source_type = 'telegram_audio' if media_type == 'audio' else 'telegram'
+    job = _get_store().get_job(job_id)
+    if (
+        job is None
+        or job['status'] != 'queued'
+        or job['source_type'] != source_type
+    ):
+        return
+    if not _get_store().update_job(
+        job_id,
+        expected_status='queued',
+        status='processing',
+    ):
+        return
+
+    logger.info(
+        'Starting Telegram %s transcription for job %s.',
+        media_type,
+        job_id,
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix='telegram-upload-') as output_dir:
+            if progress_callback is not None:
+                progress_callback(f'Downloading your {media_type} from Telegram...')
+            download_media = (
+                _download_telegram_audio
+                if media_type == 'audio'
+                else _download_telegram_video
+            )
+            transcribe_media = (
+                transcribe_uploaded_audio
+                if media_type == 'audio'
+                else transcribe_uploaded_video
+            )
+            media_path = download_media(job['telegram_file_id'], output_dir)
+            transcript_callback = (
+                _transcript_draft_callback(job['chat_id'])
+                if job['chat_id'] > 0
+                else None
+            )
+            transcript_path = transcribe_media(
+                media_path,
+                output_dir,
+                progress_callback,
+                transcript_callback,
+            )
+            transcript = transcript_path.read_text(encoding='utf-8').rstrip('\n')
+            if progress_callback is not None:
+                progress_callback('Transcription complete. Sending the text...')
+            _send_transcript(
+                job['chat_id'],
+                transcript,
+            )
+    except Exception as error:
+        logger.exception(
+            'Telegram %s transcription failed for job %s.',
+            media_type,
+            job_id,
+        )
+        failure_message = (
+            str(error)
+            if isinstance(error, ValueError)
+            else (
+                f'Could not download or transcribe this {media_type}. '
+                f'Please try another {media_type} file.'
+            )
+        )
+        _fail_job(
+            job_id,
+            type(error).__name__,
+            failure_message,
+            progress_callback,
+            expected_status='processing',
+        )
+        return
+
+    completed = _get_store().update_job(
+        job_id,
+        status='completed',
+        title=f'Telegram {media_type}',
+        completed_at=_now(),
+    )
+    if progress_callback is not None:
+        progress_callback('Transcription complete.')
+    if completed:
+        _log_job_completion(job_id, f'Telegram {media_type} transcription')
+
+
+def _process_telegram_video_job(job_id, progress_callback=None):
+    _process_telegram_upload_job(job_id, 'video', progress_callback)
+
+
+def _process_telegram_audio_job(job_id, progress_callback=None):
+    _process_telegram_upload_job(job_id, 'audio', progress_callback)
 
 
 def _valid_telegram_ids(user_id, chat_id):
@@ -1284,21 +1622,122 @@ def _youtube_url_from_text(text, entities=None):
     return None
 
 
+def _telegram_media_attachment(message):
+    for field in ('video', 'video_note'):
+        media = message.get(field)
+        if isinstance(media, dict):
+            return media, 'video'
+    for field in ('voice', 'audio'):
+        media = message.get(field)
+        if isinstance(media, dict):
+            return media, 'voice' if field == 'voice' else 'audio'
+    document = message.get('document')
+    if not isinstance(document, dict):
+        return None
+    mime_type = document.get('mime_type')
+    file_name = document.get('file_name')
+    guessed_type = (
+        mimetypes.guess_type(file_name)[0]
+        if isinstance(file_name, str)
+        else None
+    )
+    for content_type in (mime_type, guessed_type):
+        if isinstance(content_type, str):
+            if content_type.casefold().startswith('video/'):
+                return document, 'video'
+            if content_type.casefold().startswith('audio/'):
+                return document, 'audio'
+    return None
+
+
+def _queue_telegram_media(media, media_type, update_id, user_id, chat_id):
+    file_id = media.get('file_id')
+    media_label = {
+        'audio': 'audio file',
+        'video': 'video',
+        'voice': 'voice message',
+    }[media_type]
+    if not isinstance(file_id, str) or not file_id:
+        _send_message(chat_id, f'Telegram could not read this {media_label} attachment.')
+        return
+    file_size = media.get('file_size')
+    if isinstance(file_size, int) and not isinstance(file_size, bool):
+        if file_size > _MAX_TELEGRAM_DOWNLOAD_BYTES:
+            _send_message(
+                chat_id,
+                f'This {media_label} is larger than Telegram bot downloads support '
+                '(20 MB). Please send a smaller file.',
+            )
+            return
+
+    source_type = 'telegram' if media_type == 'video' else 'telegram_audio'
+    try:
+        job_id, created = _get_store().create_job(
+            update_id,
+            'telegram-upload',
+            user_id,
+            chat_id,
+            source_type=source_type,
+            telegram_file_id=file_id,
+        )
+    except QueueAdmissionError as error:
+        if error.reason == 'user_already_processing':
+            rejection_message = (
+                f'Your {media_label} has already started processing. Please wait for '
+                'it to finish before sending another.'
+            )
+        elif error.reason == 'queue_full':
+            rejection_message = (
+                'The queue is full: one active job and up to three waiting users. '
+                'Please try again when a slot opens.'
+            )
+        else:
+            raise
+        _send_message(chat_id, rejection_message)
+        return
+    if not created:
+        _send_message(
+            chat_id,
+            'This video request has already been received.',
+        )
+        return
+
+    progress_callback = None
+    processor = (
+        _process_telegram_audio_job
+        if media_type != 'video'
+        else _process_telegram_video_job
+    )
+    try:
+        progress_callback = _send_progress_message(
+            chat_id,
+            f'{_queue_status_message(job_id)}\n\n'
+            f'{media_label.capitalize()} received and queued. TinyASR will detect '
+            'the spoken language automatically and send the transcription here.',
+        )
+    finally:
+        _submit_job(processor, job_id, progress_callback)
+
+
+def _queue_telegram_video(video, update_id, user_id, chat_id):
+    _queue_telegram_media(video, 'video', update_id, user_id, chat_id)
+
+
 def _send_help(chat_id):
     _send_message(
         chat_id,
-        'Send a YouTube video URL to compare its audio transcription with the subtitles. '
-        'If multiple compatible subtitle tracks are available, you can choose one.\n\n'
+        'Send either:\n'
+        '- A YouTube video link to compare its subtitles with TinyASR, or\n'
+        '- A video directly in Telegram, a voice message, or an audio file for transcription.\n'
+        'TinyASR detects the spoken language automatically. Telegram uploads must '
+        'be 20 MB or smaller and no longer than 60 minutes.\n\n'
+
         'WER (Word Error Rate) is the number of word substitutions, deletions, '
         'and insertions divided by the number of words in the subtitles.\n'
         'CER (Character Error Rate) uses the same calculation at the character '
         'level, divided by the number of characters in the subtitles.\n'
-        'Lower scores indicate a closer match; 0% means an exact match.\n'
-        'Use /reports to view your saved reports.\n'
-        'Only one video is processed at a time. Up to three other users can wait, '
-        'and each user can have one queued or processing request.\n'
-        'A new link replaces your pending request; once processing starts, you must '
-        'wait for it to finish.',
+        'Lower scores indicate a closer match; 0% means an exact match.\n\n'
+        'Use /reports to view your saved reports.\n\n'
     )
 
 
@@ -1400,7 +1839,7 @@ def _handle_message(message, update_id):
     text = message.get('text')
     user = message.get('from')
     chat = message.get('chat')
-    if not isinstance(text, str) or not isinstance(user, dict) or not isinstance(chat, dict):
+    if not isinstance(user, dict) or not isinstance(chat, dict):
         return
 
     user_id = user.get('id')
@@ -1408,6 +1847,14 @@ def _handle_message(message, update_id):
     if not _valid_telegram_ids(user_id, chat_id):
         return
     if not _request_user_approval(user, user_id, chat_id):
+        return
+
+    telegram_media = _telegram_media_attachment(message)
+    if telegram_media is not None:
+        media, media_type = telegram_media
+        _queue_telegram_media(media, media_type, update_id, user_id, chat_id)
+        return
+    if not isinstance(text, str):
         return
 
     words = text.strip().split(maxsplit=1)
@@ -1423,7 +1870,8 @@ def _handle_message(message, update_id):
     if not youtube_url:
         _send_message(
             chat_id,
-            'Send a valid YouTube URL. Use /help for instructions.',
+            'Send a YouTube video link or upload a Telegram video, voice message, '
+            'or audio file (up to 20 MB and 60 minutes). Use /help for instructions.',
         )
         return
 
@@ -1467,6 +1915,7 @@ def _handle_message(message, update_id):
     try:
         _send_message(
             chat_id,
+            f"{_queue_status_message(job_id)}\n"
             'Video received and added to the queue. The bot processes one video at a time.',
         )
     finally:
@@ -1650,6 +2099,7 @@ def _handle_callback_query(callback, update_id=None):
             _answer_callback(callback_id, 'Starting a new comparison.')
             _send_message(
                 chat_id,
+                f"{_queue_status_message(job_id)}\n"
                 'Video received and added to the queue. The bot processes one video at a time.',
             )
         finally:
@@ -1670,6 +2120,7 @@ def _handle_callback_query(callback, update_id=None):
             progress_callback = _start_progress_message(
                 chat_id,
                 message.get('message_id'),
+                f"{_queue_status_message(job_id)}\n"
                 'Language selected. Preparing the audio and subtitle download...',
             )
         finally:
@@ -1692,13 +2143,19 @@ def _recover_jobs():
     for saved_job in _get_store().active_jobs():
         job_id = saved_job['job_id']
         status = saved_job['status']
+        processor = (
+            {
+                'telegram': _process_telegram_video_job,
+                'telegram_audio': _process_telegram_audio_job,
+            }.get(saved_job['source_type'], _process_job)
+        )
         try:
             if status == 'discovering':
                 _submit_job(_discover_job, job_id)
             elif status in {'queued', 'processing'}:
                 if status == 'processing':
                     _get_store().update_job(job_id, status='queued')
-                _submit_job(_process_job, job_id)
+                _submit_job(processor, job_id)
             elif status == 'awaiting_language':
                 _send_language_prompt(job_id)
         except Exception:

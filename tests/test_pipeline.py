@@ -14,10 +14,137 @@ from pipeline import (
     inspect_video,
     process_video,
     select_audio_format,
+    transcribe_uploaded_audio,
+    transcribe_uploaded_video,
 )
 
 
 class AudioFormatTests(unittest.TestCase):
+    def test_uploaded_video_audio_is_extracted_and_transcribed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / 'video.mp4'
+            video_path.write_bytes(b'video')
+            probe_result = type(
+                'ProbeResult',
+                (),
+                {
+                    'stdout': json.dumps({
+                        'format': {'duration': '30.0'},
+                        'streams': [{'codec_type': 'audio'}],
+                    })
+                },
+            )()
+            with (
+                patch(
+                    'pipeline.subprocess.run',
+                    side_effect=[probe_result, None],
+                ) as run,
+                patch('pipeline.transcribe', return_value='Bonjour.') as transcribe,
+            ):
+                transcript_path = transcribe_uploaded_video(
+                    video_path,
+                    temp_dir,
+                )
+
+            self.assertEqual(
+                transcript_path.read_text(encoding='utf-8'),
+                'Bonjour.\n',
+            )
+            self.assertIn('-map', run.call_args_list[1].args[0])
+            self.assertIn('0:a:0', run.call_args_list[1].args[0])
+            transcribe.assert_called_once_with(
+                Path(temp_dir) / 'uploaded-video-audio.mp3',
+                None,
+                None,
+                None,
+                auto_detect=True,
+                transcript_callback=None,
+            )
+
+    def test_uploaded_audio_is_normalized_and_transcribed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / 'voice.oga'
+            audio_path.write_bytes(b'audio')
+            probe_result = type(
+                'ProbeResult',
+                (),
+                {
+                    'stdout': json.dumps({
+                        'format': {'duration': '30.0'},
+                        'streams': [{'codec_type': 'audio'}],
+                    })
+                },
+            )()
+            with (
+                patch(
+                    'pipeline.subprocess.run',
+                    side_effect=[probe_result, None],
+                ) as run,
+                patch('pipeline.transcribe', return_value='Bonjour.') as transcribe,
+            ):
+                transcript_path = transcribe_uploaded_audio(
+                    audio_path,
+                    temp_dir,
+                )
+
+            self.assertEqual(
+                transcript_path.read_text(encoding='utf-8'),
+                'Bonjour.\n',
+            )
+            ffmpeg_args = run.call_args_list[1].args[0]
+            self.assertIn(str(audio_path), ffmpeg_args)
+            self.assertEqual(ffmpeg_args[ffmpeg_args.index('-ar') + 1], '16000')
+            transcribe.assert_called_once_with(
+                Path(temp_dir) / 'uploaded-audio.mp3',
+                None,
+                None,
+                None,
+                auto_detect=True,
+                transcript_callback=None,
+            )
+
+    def test_uploaded_video_rejects_duration_over_one_hour(self):
+        probe_result = type(
+            'ProbeResult',
+            (),
+            {
+                'stdout': json.dumps({
+                    'format': {'duration': '3601'},
+                    'streams': [{'codec_type': 'audio'}],
+                })
+            },
+        )()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch('pipeline.subprocess.run', return_value=probe_result),
+            self.assertRaisesRegex(ValueError, '60 minutes'),
+        ):
+            transcribe_uploaded_video(
+                Path(temp_dir) / 'video.mp4',
+                temp_dir,
+            )
+
+    def test_uploaded_video_without_audio_is_rejected(self):
+        probe_result = type(
+            'ProbeResult',
+            (),
+            {
+                'stdout': json.dumps({
+                    'format': {'duration': '30'},
+                    'streams': [{'codec_type': 'video'}],
+                })
+            },
+        )()
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch('pipeline.subprocess.run', return_value=probe_result),
+            self.assertRaisesRegex(ValueError, 'does not contain an audio track'),
+        ):
+            transcribe_uploaded_video(
+                Path(temp_dir) / 'video.mp4',
+                temp_dir,
+            )
+
     def test_inspect_video_accepts_a_duration_of_one_hour(self):
         with patch(
             'pipeline._extract_info',
@@ -199,6 +326,18 @@ class AudioFormatTests(unittest.TestCase):
 
     def test_process_video_logs_transcription_and_comparison_stages(self):
         progress_updates = []
+        transcript_updates = []
+
+        def transcribe_audio(
+            _audio_path,
+            _model_label,
+            _language_code,
+            _progress_callback,
+            transcript_callback=None,
+        ):
+            transcript_callback('hello')
+            return 'hello there'
+
         with tempfile.TemporaryDirectory() as output_dir:
             audio_path = Path(output_dir) / 'audio.mp3'
             audio_path.write_bytes(b'audio')
@@ -222,9 +361,12 @@ class AudioFormatTests(unittest.TestCase):
                         }
                     ],
                 ),
-                patch('pipeline.transcribe', return_value='hello there'),
+                patch('pipeline.transcribe', side_effect=transcribe_audio) as transcribe,
                 self.assertLogs('pipeline', level='INFO') as captured,
             ):
+                transcript_callback = (
+                    lambda text: transcript_updates.append(text) or True
+                )
                 result = process_video(
                     'https://www.youtube.com/watch?v=M8qOjBw2Vo8',
                     {
@@ -233,8 +375,17 @@ class AudioFormatTests(unittest.TestCase):
                     },
                     output_dir,
                     progress_updates.append,
+                    transcript_callback,
                 )
 
+            transcribe.assert_called_once_with(
+                audio_path,
+                'English, Russian, Ukrainian',
+                'en',
+                progress_updates.append,
+                transcript_callback=transcript_callback,
+            )
+            self.assertEqual(transcript_updates, ['hello'])
             self.assertEqual(result['wer'], 50.0)
             self.assertEqual(result['audio_path'], audio_path)
             self.assertEqual(result['subtitle_path'], subtitle_path)

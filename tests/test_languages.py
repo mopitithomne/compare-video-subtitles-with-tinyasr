@@ -31,6 +31,5 @@ class SupportedTracksTests(unittest.TestCase):
         self.assertEqual(tracks[0]['language_code'], 'uz')
         self.assertEqual(tracks[0]['model_language_code'], 'uz-Latn')
 
-
 if __name__ == '__main__':
     unittest.main()

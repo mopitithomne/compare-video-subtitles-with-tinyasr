@@ -1,6 +1,6 @@
 # Self-hosted Telegram Bot - TinyASR
 
-The bot runs continuously on a Linux VPS with Docker Compose and uses the Telegram Bot API with **long polling**. Send it a YouTube video URL to find compatible subtitles, choose a subtitle language when needed, and compare the subtitles with TinyASR's audio transcription. Downloads and transcription run on the VPS.
+The bot runs continuously on a Linux VPS with Docker Compose and uses the Telegram Bot API with **long polling**. Send a YouTube video URL to compare compatible subtitles with TinyASR, or upload a Telegram video, voice message, or audio file to receive its TinyASR transcription. TinyASR automatically detects the spoken language. Downloads and transcription run on the VPS.
 
 ## Start the bot on a Linux VPS
 
@@ -26,7 +26,7 @@ cp .env.example .env
 nano .env
 ```
 
-Replace the value of `TELEGRAM_BOT_TOKEN` with your bot token and save the file. Restrict access to it:
+Replace the value of `TELEGRAM_BOT_TOKEN` with your bot token and save the file. Restrict access to the file:
 
 ```sh
 chmod 600 .env
@@ -76,9 +76,10 @@ The SQLite database and TinyASR Chromium profile remain in the Docker volume `bo
 - At startup, it removes any webhook configured for the bot token, then starts polling.
 - Jobs and their state are stored in SQLite. A job interrupted by a restart is resumed on the next startup.
 - New users are told that owner approval is required. The owner receives their name, username (if set), Telegram ID, and an approval button; after approval, the user receives a confirmation and can use the bot.
+- Users can upload a Telegram video, voice message, or audio file to receive its TinyASR transcription as text messages. TinyASR automatically detects the spoken language; FFmpeg prepares the audio, and no YouTube subtitles are required. For uploaded media and YouTube comparisons, interim TinyASR text streams in private chats using Telegram's ephemeral message drafts. Telegram's hosted Bot API download limit restricts uploads to 20 MB; uploads are also limited to 60 minutes.
 - Completed reports and their audio, subtitle, transcript, HTML, and alignment files are saved in the `bot-data` volume. New reports notify the configured owner with a button to retrieve them.
 - If a video already has a saved report, the bot sends it immediately and offers a button to run a fresh comparison. This reuse is global across users. `/reports` lists reports available to the requesting user; tap a report to receive its audio and HTML again.
-- The bot processes one video job at a time, with up to three additional users waiting. Each user can have only one queued or processing job. A new link silently replaces that user's job until audio processing starts; after that, new links are rejected until it finishes.
+- The bot processes one video job at a time, with up to three additional users waiting. It reports an estimated queue position when a request is admitted. Each user can have only one queued or processing job. A new link silently replaces that user's job until audio processing starts; after that, new links are rejected until it finishes.
 - Only subtitle tracks matching a language available in the video's audio tracks are offered. Manual subtitles are preferred over automatic subtitles within those languages. If the audio language cannot be verified or no matching subtitle track exists, the bot will not compare mismatched languages.
 - When automatic subtitles are used, the final result warns that they may be inaccurate. WebVTT timestamps and repeated cues are cleaned before comparison.
 - Videos are limited to 60 minutes and downloaded audio files to 500 MB. Temporary working files are deleted after the result files have been sent.

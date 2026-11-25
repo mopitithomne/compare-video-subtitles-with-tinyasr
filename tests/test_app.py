@@ -1,9 +1,10 @@
+from io import BytesIO
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import app as bot_app
 
@@ -95,7 +96,8 @@ class LocalBotTests(unittest.TestCase):
 
         send_message.assert_called_once_with(
             42,
-            'Send a valid YouTube URL. Use /help for instructions.',
+            'Send a YouTube video link or upload a Telegram video, voice message, '
+            'or audio file (up to 20 MB and 60 minutes). Use /help for instructions.',
         )
         submit_job.assert_not_called()
 
@@ -106,6 +108,10 @@ class LocalBotTests(unittest.TestCase):
         help_text = send_message.call_args.args[1]
         self.assertIn('Word Error Rate', help_text)
         self.assertIn('Character Error Rate', help_text)
+        self.assertIn('YouTube video link', help_text)
+        self.assertIn('video directly in Telegram', help_text)
+        self.assertIn('detects the spoken language automatically', help_text)
+        self.assertIn('20 MB', help_text)
         self.assertIn('/reports', help_text)
         self.assertNotIn('/id', help_text)
 
@@ -233,9 +239,322 @@ class LocalBotTests(unittest.TestCase):
 
         self.assertEqual(self.store.active_jobs()[0]['status'], 'discovering')
         self.assertIn('added to the queue', accepted_message.call_args.args[1])
+        self.assertIn('Your position is 1/1', accepted_message.call_args.args[1])
         accepted_submit.assert_called_once_with(
             bot_app._discover_job,
             self.store.active_jobs()[0]['job_id'],
+        )
+
+    def test_telegram_video_upload_is_queued_for_transcription(self):
+        update = {
+            'update_id': 727,
+            'message': {
+                'from': {'id': 42},
+                'chat': {'id': 42},
+                'video': {
+                    'file_id': 'telegram-file-id',
+                    'file_size': 1024,
+                    'duration': 12,
+                },
+            },
+        }
+        progress_callback = lambda text: True
+        with (
+            patch(
+                'app._send_progress_message',
+                return_value=progress_callback,
+            ) as send_progress,
+            patch('app._submit_job') as submit_job,
+        ):
+            bot_app._handle_update(update)
+
+        submit_job.assert_called_once()
+        function, job_id, callback = submit_job.call_args.args
+        self.assertIs(function, bot_app._process_telegram_video_job)
+        self.assertIs(callback, progress_callback)
+        job = self.store.get_job(job_id)
+        self.assertEqual(job['source_type'], 'telegram')
+        self.assertEqual(job['telegram_file_id'], 'telegram-file-id')
+        self.assertEqual(job['status'], 'queued')
+        self.assertIsNone(job['selected_track'])
+        self.assertIn(
+            'detect the spoken language automatically',
+            send_progress.call_args.args[1],
+        )
+        self.assertIn('Your position is 1/1', send_progress.call_args.args[1])
+
+    def test_telegram_voice_and_audio_uploads_are_queued_for_transcription(self):
+        self._approve_user(43)
+        document = {
+            'file_id': 'telegram-audio-document-id',
+            'mime_type': 'audio/mpeg',
+        }
+        self.assertEqual(
+            bot_app._telegram_media_attachment({'document': document}),
+            (document, 'audio'),
+        )
+        updates = [
+            {
+                'update_id': 827,
+                'message': {
+                    'from': {'id': 42},
+                    'chat': {'id': 42},
+                    'voice': {
+                        'file_id': 'telegram-voice-id',
+                        'file_size': 512,
+                        'duration': 6,
+                    },
+                },
+            },
+            {
+                'update_id': 828,
+                'message': {
+                    'from': {'id': 43},
+                    'chat': {'id': 43},
+                    'audio': {
+                        'file_id': 'telegram-audio-id',
+                        'file_size': 1024,
+                        'duration': 12,
+                    },
+                },
+            },
+        ]
+        progress_callback = lambda _text: True
+        with (
+            patch(
+                'app._send_progress_message',
+                return_value=progress_callback,
+            ) as send_progress,
+            patch('app._submit_job') as submit_job,
+        ):
+            for update in updates:
+                bot_app._handle_update(update)
+
+        self.assertEqual(submit_job.call_count, 2)
+        for call, expected_file_id in zip(
+            submit_job.call_args_list,
+            ('telegram-voice-id', 'telegram-audio-id'),
+        ):
+            function, job_id, callback = call.args
+            self.assertIs(function, bot_app._process_telegram_audio_job)
+            self.assertIs(callback, progress_callback)
+            job = self.store.get_job(job_id)
+            self.assertEqual(job['source_type'], 'telegram_audio')
+            self.assertEqual(job['telegram_file_id'], expected_file_id)
+            self.assertEqual(job['status'], 'queued')
+        self.assertEqual(send_progress.call_count, 2)
+        self.assertIn(
+            'Voice message received and queued',
+            send_progress.call_args_list[0].args[1],
+        )
+        self.assertIn(
+            'Audio file received and queued',
+            send_progress.call_args_list[1].args[1],
+        )
+
+    def test_oversized_telegram_video_is_rejected_without_queueing(self):
+        update = {
+            'update_id': 728,
+            'message': {
+                'from': {'id': 42},
+                'chat': {'id': 42},
+                'video': {
+                    'file_id': 'large-telegram-file',
+                    'file_size': 20 * 1024 * 1024 + 1,
+                },
+            },
+        }
+        with (
+            patch('app._send_message') as send_message,
+            patch('app._submit_job') as submit_job,
+        ):
+            bot_app._handle_update(update)
+
+        self.assertIn('larger than Telegram bot downloads support', send_message.call_args.args[1])
+        self.assertEqual(self.store.active_jobs(), [])
+        submit_job.assert_not_called()
+
+    def test_downloads_telegram_file_to_a_temporary_video_path(self):
+        class TelegramFileResponse(BytesIO):
+            headers = {'Content-Length': '5'}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': 'test-token'}),
+            patch(
+                'app._telegram_call',
+                return_value={'file_path': 'videos/file.mp4', 'file_size': 5},
+            ) as get_file,
+            patch(
+                'app.urllib.request.urlopen',
+                return_value=TelegramFileResponse(b'video'),
+            ) as open_file,
+        ):
+            video_path = bot_app._download_telegram_video(
+                'telegram-file-id',
+                temp_dir,
+            )
+            video_bytes = video_path.read_bytes()
+
+        get_file.assert_called_once_with('getFile', {'file_id': 'telegram-file-id'})
+        self.assertIn(
+            '/file/bottest-token/videos/file.mp4',
+            open_file.call_args.args[0].full_url,
+        )
+        self.assertEqual(video_bytes, b'video')
+
+    def test_download_rejects_parent_paths_from_telegram(self):
+        with (
+            patch(
+                'app._telegram_call',
+                return_value={'file_path': '../outside.mp4', 'file_size': 5},
+            ),
+            tempfile.TemporaryDirectory() as temp_dir,
+            self.assertRaisesRegex(RuntimeError, 'invalid media download path'),
+        ):
+            bot_app._download_telegram_video('telegram-file-id', temp_dir)
+
+    def test_transcript_draft_updates_reuse_one_nonzero_draft_id(self):
+        with patch('app._telegram_call', return_value=True) as telegram_call:
+            update_draft = bot_app._transcript_draft_callback(42)
+            self.assertTrue(update_draft('First words'))
+            self.assertTrue(update_draft('First words'))
+            self.assertTrue(update_draft('x' * 5_000))
+
+        self.assertEqual(telegram_call.call_count, 2)
+        first_payload = telegram_call.call_args_list[0].args[1]
+        second_payload = telegram_call.call_args_list[1].args[1]
+        self.assertEqual(telegram_call.call_args_list[0].args[0], 'sendMessageDraft')
+        self.assertEqual(first_payload['chat_id'], 42)
+        self.assertGreater(first_payload['draft_id'], 0)
+        self.assertEqual(first_payload['draft_id'], second_payload['draft_id'])
+        self.assertEqual(len(second_payload['text']), 4_096)
+
+    def test_uploaded_video_job_downloads_transcribes_and_sends_text(self):
+        job_id, _ = self.store.create_job(
+            729,
+            'telegram-upload',
+            42,
+            42,
+            source_type='telegram',
+            telegram_file_id='telegram-file-id',
+        )
+
+        def write_transcript(_video_path, output_dir, _progress, transcript_callback):
+            transcript_path = Path(output_dir) / 'tinyasr-transcript.txt'
+            transcript_path.write_text('Hello from the video.', encoding='utf-8')
+            transcript_callback('Hello from the video.')
+            return transcript_path
+
+        draft_callback = lambda _text: True
+        with (
+            self.assertLogs('telegram_asr_bot', level='INFO') as completion_logs,
+            patch(
+                'app._download_telegram_video',
+                return_value=Path('video.mp4'),
+            ) as download_video,
+            patch(
+                'app._transcript_draft_callback',
+                return_value=draft_callback,
+            ),
+            patch(
+                'app.transcribe_uploaded_video',
+                side_effect=write_transcript,
+            ) as transcribe_video,
+            patch('app._send_message') as send_message,
+        ):
+            bot_app._process_telegram_video_job(job_id)
+
+        self.assertEqual(self.store.get_job(job_id)['status'], 'completed')
+        self.assertIn(
+            'Telegram video transcription completed for job',
+            '\n'.join(completion_logs.output),
+        )
+        self.assertIn(
+            'No active video jobs remain; the bot can be safely restarted.',
+            '\n'.join(completion_logs.output),
+        )
+        download_video.assert_called_once()
+        transcribe_video.assert_called_once_with(
+            Path('video.mp4'),
+            ANY,
+            None,
+            draft_callback,
+        )
+        send_message.assert_called_once_with(
+            42,
+            'Transcript:\n\nHello from the video.',
+        )
+
+    def test_uploaded_audio_job_downloads_transcribes_and_sends_text(self):
+        job_id, _ = self.store.create_job(
+            830,
+            'telegram-upload',
+            42,
+            42,
+            source_type='telegram_audio',
+            telegram_file_id='telegram-audio-id',
+        )
+
+        def write_transcript(_audio_path, output_dir, _progress, transcript_callback):
+            transcript_path = Path(output_dir) / 'tinyasr-transcript.txt'
+            transcript_path.write_text('Hello from the audio.', encoding='utf-8')
+            transcript_callback('Hello from the audio.')
+            return transcript_path
+
+        draft_callback = lambda _text: True
+        with (
+            self.assertLogs('telegram_asr_bot', level='INFO') as completion_logs,
+            patch(
+                'app._download_telegram_audio',
+                return_value=Path('voice.oga'),
+            ) as download_audio,
+            patch(
+                'app._transcript_draft_callback',
+                return_value=draft_callback,
+            ),
+            patch(
+                'app.transcribe_uploaded_audio',
+                side_effect=write_transcript,
+            ) as transcribe_audio,
+            patch('app._send_message') as send_message,
+        ):
+            bot_app._process_telegram_audio_job(job_id)
+
+        self.assertEqual(self.store.get_job(job_id)['status'], 'completed')
+        self.assertIn(
+            'Telegram audio transcription completed for job',
+            '\n'.join(completion_logs.output),
+        )
+        download_audio.assert_called_once()
+        transcribe_audio.assert_called_once_with(
+            Path('voice.oga'),
+            ANY,
+            None,
+            draft_callback,
+        )
+        send_message.assert_called_once_with(
+            42,
+            'Transcript:\n\nHello from the audio.',
+        )
+
+    def test_transcript_output_is_split_to_fit_telegram_message_limits(self):
+        transcript = 'a' * (bot_app._TRANSCRIPT_MESSAGE_CHARS + 10)
+        with patch('app._send_message') as send_message:
+            bot_app._send_transcript(42, transcript)
+
+        self.assertEqual(send_message.call_count, 2)
+        messages = [call.args[1] for call in send_message.call_args_list]
+        self.assertTrue(all(len(message) <= 4096 for message in messages))
+        self.assertEqual(
+            messages[0].split('\n\n', 1)[1] + messages[1].split('\n\n', 1)[1],
+            transcript,
         )
 
     def test_only_the_owner_can_approve_access_requests(self):
@@ -450,6 +769,50 @@ class LocalBotTests(unittest.TestCase):
         )
         self.assertTrue(created)
 
+    def test_queue_position_counts_active_jobs_and_processing_jobs(self):
+        first_job_id, _ = self.store.create_job(
+            810,
+            'https://youtu.be/dQw4w9WgXcQ',
+            50,
+            50,
+        )
+        second_job_id, _ = self.store.create_job(
+            811,
+            'https://youtu.be/dQw4w9WgXcQ',
+            51,
+            51,
+        )
+        language_job_id, _ = self.store.create_job(
+            812,
+            'https://youtu.be/dQw4w9WgXcQ',
+            52,
+            52,
+        )
+        self.store.update_job(first_job_id, status='processing')
+        self.store.update_job(second_job_id, status='queued')
+        self.store.update_job(language_job_id, status='awaiting_language')
+
+        self.assertEqual(
+            self.store.queue_position(second_job_id),
+            {
+                'position': 2,
+                'ahead': 1,
+                'active': 2,
+                'processing': 1,
+            },
+        )
+        self.assertIsNone(self.store.queue_position(language_job_id))
+        self.store.update_job(first_job_id, status='completed')
+        self.assertEqual(
+            self.store.queue_position(second_job_id),
+            {
+                'position': 1,
+                'ahead': 0,
+                'active': 1,
+                'processing': 0,
+            },
+        )
+
     def test_full_queue_sends_a_clear_message(self):
         for index in range(4):
             self.store.create_job(
@@ -599,6 +962,7 @@ class LocalBotTests(unittest.TestCase):
             progress_callback = submit_job.call_args.args[2]
             self.assertTrue(progress_callback('Step 2/4: Preparing TinyASR...'))
             edit_message.assert_called_with(42, 123, 'Step 2/4: Preparing TinyASR...')
+            self.assertIn('Your position is 1/1', edit_message.call_args_list[0].args[2])
 
         job = self.store.get_job(job_id)
         self.assertEqual(job['status'], 'queued')
@@ -661,7 +1025,9 @@ class LocalBotTests(unittest.TestCase):
             }
 
             delivery_order = []
+            transcript_callback = lambda _text: True
             with (
+                self.assertLogs('telegram_asr_bot', level='INFO') as completion_logs,
                 patch.dict(
                     os.environ,
                     {
@@ -669,7 +1035,11 @@ class LocalBotTests(unittest.TestCase):
                         'BOT_REPORTS_PATH': str(Path(temp_dir) / 'saved-reports'),
                     },
                 ),
-                patch('app.process_video', return_value=result),
+                patch('app.process_video', return_value=result) as process_video,
+                patch(
+                    'app._transcript_draft_callback',
+                    return_value=transcript_callback,
+                ),
                 patch(
                     'app._send_audio',
                     side_effect=lambda *args: delivery_order.append('audio')
@@ -683,6 +1053,13 @@ class LocalBotTests(unittest.TestCase):
                 patch('app._send_message') as send_message,
             ):
                 bot_app._process_job(job_id)
+                process_video.assert_called_once_with(
+                    'https://youtu.be/dQw4w9WgXcQ',
+                    track,
+                    ANY,
+                    None,
+                    transcript_callback=transcript_callback,
+                )
                 send_message.assert_called_once()
                 self.assertEqual(send_message.call_args.args[0], 99)
                 notification_keyboard = send_message.call_args.args[2]
@@ -701,11 +1078,15 @@ class LocalBotTests(unittest.TestCase):
                 self.assertEqual(self.store.list_reports(42)[0]['report_id'], report_id)
 
         self.assertEqual(self.store.get_job(job_id)['status'], 'completed')
+        self.assertIn(
+            'Video comparison completed for job',
+            '\n'.join(completion_logs.output),
+        )
         send_audio.assert_called_once_with(42, paths[0], 'Video')
         send_document.assert_called_once_with(
             42,
             paths[3],
-            'HTML comparison report',
+            'Open to see the differences',
             bot_app._report_details_keyboard(report_id),
         )
         send_media_group.assert_not_called()
@@ -992,6 +1373,11 @@ class LocalBotTests(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertEqual(connection.request, ('POST', '/bottest-token/sendAudio'))
         self.assertIn(b'name="audio"; filename="audio.mp3"', connection.body)
+        self.assertIn(b'name="title"\r\n\r\nVideo title', connection.body)
+        self.assertIn(
+            b'name="caption"\r\n\r\nExtracted audio file',
+            connection.body,
+        )
         self.assertIn(b'mp3 audio bytes', connection.body)
 
     def test_html_document_upload_includes_the_details_button(self):
@@ -1036,14 +1422,14 @@ class LocalBotTests(unittest.TestCase):
                 bot_app._send_document(
                     42,
                     html_path,
-                    'HTML comparison report',
+                    'Open to see the differences',
                     keyboard,
                 )
 
         self.assertEqual(connection.request, ('POST', '/bottest-token/sendDocument'))
         self.assertIn(b'name="document"; filename="report.html"', connection.body)
-        self.assertIn(b'HTML comparison report', connection.body)
-        self.assertIn(b'Voir les autres informations', connection.body)
+        self.assertIn(b'Open to see the differences', connection.body)
+        self.assertIn(b'View additional details', connection.body)
         self.assertIn(b'details|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', connection.body)
 
     def test_update_offset_survives_store_operations(self):
