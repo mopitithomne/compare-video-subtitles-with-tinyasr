@@ -1,4 +1,5 @@
 jiwer>=4,<5
+Babel>=2.16,<3
 nemo_text_processing==1.1.0
 playwright>=1.50,<2
 python-dotenv>=1,<2

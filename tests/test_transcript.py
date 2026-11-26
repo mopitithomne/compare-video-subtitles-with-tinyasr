@@ -64,6 +64,30 @@ class TranscriptTests(unittest.TestCase):
 
     def test_language_aware_normalization_matches_currency_and_units(self):
         self.assertEqual(
+            compare_texts('$', 'dollar', 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('€', 'euro', 'fr'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('$5', '5 dollars', 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('€5', '5 euros', 'fr'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('5 g', '5 grams', 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('5 g', '5 grammes', 'fr'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
             compare_texts('cinq euros', '5 €', 'fr'),
             {'wer': 0, 'cer': 0},
         )
@@ -83,6 +107,31 @@ class TranscriptTests(unittest.TestCase):
         )
         self.assertGreater(compare_texts('100 g', '100 kg', 'en')['wer'], 0)
         self.assertGreater(compare_texts('five dollars', '$5', 'it')['wer'], 0)
+
+    def test_cldr_aliases_preserve_currency_and_amount_distinctions(self):
+        self.assertEqual(
+            compare_texts('5 apples', 'five apples', 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('5 km', '5 Kilometer', 'de'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('5 £', '5 GBP', 'de'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('$5', '5 dollars', 'fr'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('$1.50', '1.5 dollars', 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertGreater(compare_texts('5 USD', '5 CAD', 'en')['wer'], 0)
+        self.assertGreater(compare_texts('5 dollars', '6 dollars', 'en')['wer'], 0)
+        self.assertGreater(compare_texts('$5', '5 USD', 'en')['wer'], 0)
 
     def test_normalized_report_keeps_raw_text_without_highlighting_equivalences(self):
         cues = [

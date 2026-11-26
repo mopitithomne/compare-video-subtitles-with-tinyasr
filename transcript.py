@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import unicodedata
+from collections import defaultdict
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
@@ -18,7 +19,7 @@ _VTT_TIMESTAMP_RE = re.compile(
 )
 _VTT_INLINE_TIMESTAMP_RE = re.compile(r'<\d{2}:\d{2}:\d{2}\.\d+>')
 _VTT_SHORT_CUE_SECONDS = 0.05
-_NEMO_ITN_LANGUAGES = frozenset({'ar', 'de', 'en', 'es', 'fr', 'pt', 'ru'})
+_NEMO_NORMALIZATION_LANGUAGES = frozenset({'ar', 'de', 'en', 'es', 'fr', 'pt', 'ru'})
 logger = logging.getLogger(__name__)
 
 
@@ -61,15 +62,31 @@ def normalize(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def _itn_language(language):
+def _normalization_language(language):
     if not isinstance(language, str):
         return None
     language = language.replace('_', '-').split('-', 1)[0].casefold()
-    return language if language in _NEMO_ITN_LANGUAGES else None
+    return language if language in _NEMO_NORMALIZATION_LANGUAGES else None
 
 
 @lru_cache(maxsize=2)
-def _inverse_normalizer(language):
+def _text_normalizer(language):
+    from nemo_text_processing.text_normalization.normalize import Normalizer
+
+    cache_dir = Path(
+        os.environ.get('NEMO_TEXT_CACHE_DIR', 'data/nemo_text_processing')
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    logger.info('Loading NeMo text normalization for %s.', language)
+    return Normalizer(
+        input_case='lower_cased',
+        lang=language,
+        cache_dir=str(cache_dir),
+    )
+
+
+@lru_cache(maxsize=2)
+def _inverse_text_normalizer(language):
     from nemo_text_processing.inverse_text_normalization.inverse_normalize import (
         InverseNormalizer,
     )
@@ -86,7 +103,7 @@ def _inverse_normalizer(language):
     )
 
 
-def _prepare_for_inverse_normalization(text):
+def _prepare_for_normalization(text):
     text = text.casefold()
     prepared = []
     for index, char in enumerate(text):
@@ -106,7 +123,7 @@ def _prepare_for_inverse_normalization(text):
     return re.sub(r'\s+', ' ', ''.join(prepared)).strip()
 
 
-def _inverse_normalization_chunks(text, normalizer):
+def _normalization_chunks(text, normalizer):
     sentences = normalizer.split_text_into_sentences(text)
     chunks = []
     current_sentences = []
@@ -135,25 +152,355 @@ def _inverse_normalization_chunks(text, normalizer):
     return chunks
 
 
+def _record_alias(aliases, alias, identifier):
+    key = tuple(normalize(alias).split())
+    if key:
+        aliases[key].add(identifier)
+
+
+@lru_cache(maxsize=7)
+def _cldr_comparison_data(language):
+    from babel import Locale
+    from babel.numbers import format_decimal, get_currency_name
+    from babel.units import UnknownUnitError, format_unit
+
+    locale = Locale.parse(language)
+    currency_candidates = defaultdict(set)
+    currency_names = {}
+    currency_family_candidates = defaultdict(set)
+
+    for code, display_name in locale.currencies.items():
+        if len(code) != 3 or not code.isalpha():
+            continue
+        identifier = f'currency_{code.casefold()}'
+        names = {display_name}
+        for count in (1, 2):
+            name = get_currency_name(code, count=count, locale=locale)
+            if name:
+                names.add(name)
+        currency_names[code] = names
+        for name in names:
+            _record_alias(currency_candidates, name, identifier)
+            for token in normalize(name).split():
+                if len(token) > 3 and token.isalpha():
+                    currency_family_candidates[token].add(code)
+        _record_alias(currency_candidates, code, identifier)
+
+    currency_aliases = {
+        alias: next(iter(identifiers))
+        for alias, identifiers in currency_candidates.items()
+        if len(identifiers) == 1
+    }
+    family_tokens = {
+        token: codes
+        for token, codes in currency_family_candidates.items()
+        if len(codes) >= 3
+    }
+    family_parents = {token: token for token in family_tokens}
+
+    def find_family(token):
+        while family_parents[token] != token:
+            family_parents[token] = family_parents[family_parents[token]]
+            token = family_parents[token]
+        return token
+
+    family_names = list(family_tokens)
+    for index, first in enumerate(family_names):
+        for second in family_names[index + 1:]:
+            first_codes = family_tokens[first]
+            second_codes = family_tokens[second]
+            overlap = len(first_codes & second_codes) / len(
+                first_codes | second_codes
+            )
+            # Inflected currency names may differ slightly in their CLDR code sets.
+            if overlap >= 0.75:
+                family_parents[find_family(second)] = find_family(first)
+
+    currency_families = defaultdict(list)
+    for token in family_tokens:
+        currency_families[find_family(token)].append(token)
+    for tokens in currency_families.values():
+        identifier = f'currency_family_{min(tokens, key=len)}'
+        for token in tokens:
+            currency_aliases[(token,)] = identifier
+
+    usd_name_tokens = {
+        token
+        for name in currency_names.get('USD', ())
+        for token in normalize(name).split()
+    }
+    dollar_family_aliases = [
+        alias[0]
+        for alias, identifier in currency_aliases.items()
+        if len(alias) == 1
+        and identifier.startswith('currency_family_')
+        and alias[0] in usd_name_tokens
+    ]
+
+    symbol_candidates = defaultdict(set)
+    for code, symbol in locale.currency_symbols.items():
+        if len(code) == 3 and code.isalpha() and symbol:
+            symbol_candidates[symbol].add(code)
+    symbol_replacements = {}
+    for symbol, codes in symbol_candidates.items():
+        if symbol == '$' and dollar_family_aliases:
+            symbol_replacements[symbol] = max(
+                dollar_family_aliases,
+                key=len,
+            )
+        elif len(codes) == 1:
+            code = next(iter(codes))
+            name = get_currency_name(code, count=2, locale=locale)
+            if name:
+                symbol_replacements[symbol] = name
+    if dollar_family_aliases:
+        symbol_replacements['$'] = max(dollar_family_aliases, key=len)
+
+    unit_candidates = defaultdict(set)
+    for unit_id in locale.unit_display_names:
+        for length in ('long', 'short'):
+            for value in (0, 1, 2, 5):
+                try:
+                    formatted = format_unit(
+                        value,
+                        unit_id,
+                        length=length,
+                        locale=locale,
+                    )
+                except UnknownUnitError:
+                    continue
+                number = format_decimal(value, locale=locale)
+                if formatted.startswith(number):
+                    unit_name = formatted[len(number):]
+                elif formatted.endswith(number):
+                    unit_name = formatted[:-len(number)]
+                else:
+                    continue
+                _record_alias(unit_candidates, unit_name, unit_id)
+
+    unit_aliases = {
+        alias: next(iter(identifiers))
+        for alias, identifiers in unit_candidates.items()
+        if len(identifiers) == 1
+    }
+    gram_alias = ('g',)
+    # Case folding can collapse distinct narrow symbols, such as g and G.
+    if 'mass-gram' in unit_candidates.get(gram_alias, set()):
+        unit_aliases[gram_alias] = 'mass-gram'
+
+    return locale, currency_aliases, unit_aliases, symbol_replacements
+
+
+def _expand_currency_symbols(text, symbol_replacements):
+    amount = r'\d+(?:[.,٫]\d+)*'
+    for symbol, currency_name in sorted(
+        symbol_replacements.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        escaped_symbol = re.escape(symbol)
+        text = re.sub(
+            rf'{escaped_symbol}\s*({amount})',
+            rf'\1 {currency_name}',
+            text,
+        )
+        text = re.sub(
+            rf'({amount})\s*{escaped_symbol}',
+            rf'\1 {currency_name}',
+            text,
+        )
+        text = text.replace(symbol, f' {currency_name} ')
+    return text
+
+
+def _comparison_tokens(text):
+    protected_punctuation = {
+        ',': '\ue000',
+        '.': '\ue001',
+        '٫': '\ue002',
+    }
+    for punctuation, marker in protected_punctuation.items():
+        text = re.sub(
+            rf'(?<=\d){re.escape(punctuation)}(?=\d)',
+            marker,
+            text,
+        )
+    tokens = normalize(text).split()
+    return [
+        token.translate(str.maketrans({
+            marker: punctuation
+            for punctuation, marker in protected_punctuation.items()
+        }))
+        for token in tokens
+    ]
+
+
+def _matching_alias(tokens, start, aliases, max_alias_length):
+    max_end = min(len(tokens), start + max_alias_length)
+    for end in range(max_end, start, -1):
+        identifier = aliases.get(tuple(tokens[start:end]))
+        if identifier is not None:
+            return identifier, end - start
+    return None
+
+
+def _quantity_token(kind, identifier, amount=None):
+    identifier = re.sub(r'[^a-z0-9]', '', identifier.casefold())
+    token = f'q{kind}{identifier}'
+    if amount is not None:
+        amount = amount.replace('-', 'minus').replace('.', 'point')
+        token += f'v{amount}'
+    return token
+
+
+def _unparsed_comparison_token(token):
+    return [part for part in re.split(r'[.,٫]', token) if part]
+
+
+def _normalize_unmatched_numbers(tokens, language):
+    number_pattern = re.compile(r'\d+(?:[.,٫]\d+)*')
+    if not any(number_pattern.fullmatch(token) for token in tokens):
+        return tokens
+
+    normalizer = _text_normalizer(language)
+    result = []
+    for token in tokens:
+        if number_pattern.fullmatch(token):
+            normalized = normalizer.normalize(token, verbose=False)
+            result.extend(_comparison_tokens(normalized))
+        else:
+            result.append(token)
+    return result
+
+
+def _quantity_amount(token, locale):
+    from babel.numbers import NumberFormatError, parse_decimal
+
+    if not re.fullmatch(r'\d+(?:[.,٫]\d+)*', token):
+        return None
+    try:
+        return format(parse_decimal(token, locale=locale).normalize(), 'f')
+    except NumberFormatError:
+        return None
+
+
+def _canonicalize_comparison_tokens(
+    tokens,
+    locale,
+    currency_aliases,
+    unit_aliases,
+):
+    result = []
+    index = 0
+    max_currency_alias_length = max(
+        (len(alias) for alias in currency_aliases),
+        default=0,
+    )
+    max_unit_alias_length = max(
+        (len(alias) for alias in unit_aliases),
+        default=0,
+    )
+    while index < len(tokens):
+        token = tokens[index]
+        amount = _quantity_amount(token, locale)
+
+        if amount is not None:
+            currency = _matching_alias(
+                tokens,
+                index + 1,
+                currency_aliases,
+                max_currency_alias_length,
+            )
+            unit = _matching_alias(
+                tokens,
+                index + 1,
+                unit_aliases,
+                max_unit_alias_length,
+            )
+            if currency and unit:
+                result.append(token)
+                index += 1
+            elif currency:
+                identifier, alias_length = currency
+                result.append(_quantity_token('currency', identifier, amount))
+                index += alias_length + 1
+            elif unit:
+                identifier, alias_length = unit
+                result.append(_quantity_token('unit', identifier, amount))
+                index += alias_length + 1
+            else:
+                result.append(token)
+                index += 1
+            continue
+
+        currency = _matching_alias(
+            tokens,
+            index,
+            currency_aliases,
+            max_currency_alias_length,
+        )
+        unit = _matching_alias(
+            tokens,
+            index,
+            unit_aliases,
+            max_unit_alias_length,
+        )
+        if currency and unit:
+            result.extend(tokens[index:index + max(currency[1], unit[1])])
+            index += max(currency[1], unit[1])
+        elif currency:
+            identifier, alias_length = currency
+            amount = (
+                _quantity_amount(tokens[index + alias_length], locale)
+                if index + alias_length < len(tokens)
+                else None
+            )
+            if amount is not None:
+                result.append(
+                    _quantity_token('currency', identifier, amount),
+                )
+                index += alias_length + 1
+            else:
+                result.append(_quantity_token('currency', identifier))
+                index += alias_length
+        else:
+            result.extend(_unparsed_comparison_token(token))
+            index += 1
+    return _normalize_unmatched_numbers(result, locale.language)
+
+
 def _comparison_words(text, language=None):
-    language = _itn_language(language)
+    language = _normalization_language(language)
     if language is not None:
-        normalizer = _inverse_normalizer(language)
+        locale, currency_aliases, unit_aliases, symbol_replacements = (
+            _cldr_comparison_data(language)
+        )
+        normalizer = _inverse_text_normalizer(language)
         normalized = ' '.join(
             normalizer.inverse_normalize(
-                _prepare_for_inverse_normalization(chunk),
+                _prepare_for_normalization(chunk),
                 verbose=False,
             )
-            for chunk in _inverse_normalization_chunks(text, normalizer)
+            for chunk in _normalization_chunks(text, normalizer)
+        )
+        normalized = _expand_currency_symbols(
+            normalized,
+            symbol_replacements,
+        )
+        tokens = _comparison_tokens(normalized)
+        return _canonicalize_comparison_tokens(
+            tokens,
+            locale,
+            currency_aliases,
+            unit_aliases,
         )
     else:
-        normalized = text
-    return normalize(normalized).split()
+        return normalize(text).split()
 
 
 def _mapped_comparison_words(text, language=None):
     raw_spans = _word_spans(text)
-    language = _itn_language(language)
+    language = _normalization_language(language)
     if language is None:
         return [
             (word, index, index + 1)
@@ -763,7 +1110,7 @@ def _align_normalized_texts(source_text, hypothesis, language):
 
 
 def align_transcript_texts(source_text, hypothesis, language=None):
-    if _itn_language(language) is not None:
+    if _normalization_language(language) is not None:
         return _align_normalized_texts(source_text, hypothesis, language)
 
     source_spans = _word_spans(source_text)

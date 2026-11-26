@@ -91,7 +91,7 @@ The SQLite database and TinyASR Chromium profile remain in the Docker volume `bo
 - **WER (Word Error Rate)** measures word-level transcription errors: word substitutions, deletions, and insertions divided by the number of words in the reference subtitles.
 - **CER (Character Error Rate)** uses the same calculation at the character level, divided by the number of characters in the reference subtitles.
 - Lower WER and CER scores mean the transcription is closer to the subtitles. A score of 0% means an exact match.
-- For English, French, Spanish, Portuguese, Russian, German, and Arabic, spoken number, currency, and measurement forms are normalized for comparison while the HTML report preserves the original subtitle and transcript text. Other languages use the existing text comparison.
+- For English, French, Spanish, Portuguese, Russian, German, and Arabic, NeMo normalizes spoken numbers and Babel's CLDR data supplies localized currency and unit names and symbols for comparison. The HTML report preserves the original subtitle and transcript text. Other languages use the existing text comparison.
 
 ## Data and secrets
 
