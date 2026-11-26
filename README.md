@@ -75,11 +75,12 @@ The SQLite database and TinyASR Chromium profile remain in the Docker volume `bo
 - The bot uses Telegram's `getUpdates` long-polling API and saves the latest processed update ID in SQLite.
 - At startup, it removes any webhook configured for the bot token, then starts polling.
 - Jobs and their state are stored in SQLite. A job interrupted by a restart is resumed on the next startup.
-- New users are told that owner approval is required. The owner receives their name, username (if set), Telegram ID, and an approval button; after approval, the user receives a confirmation and can use the bot.
+- New users are told that owner approval is required. The owner receives their name, username (if set), Telegram ID, and an approval button; after approval, the user receives a confirmation and can use the bot. In a private chat, the owner can use `/users` to list approved users and remove access.
 - Users can upload a Telegram video, voice message, or audio file to receive its TinyASR transcription as text messages. TinyASR automatically detects the spoken language; FFmpeg prepares the audio, and no YouTube subtitles are required. For uploaded media and YouTube comparisons, interim TinyASR text streams in private chats using Telegram's ephemeral message drafts. Telegram's hosted Bot API download limit restricts uploads to 20 MB; uploads are also limited to 60 minutes.
 - Completed reports and their audio, subtitle, transcript, HTML, and alignment files are saved in the `bot-data` volume. New reports notify the configured owner with a button to retrieve them.
 - If a video already has a saved report, the bot sends it immediately and offers a button to run a fresh comparison. This reuse is global across users. `/reports` lists reports available to the requesting user; tap a report to receive its audio and HTML again.
 - The bot processes one video job at a time, with up to three additional users waiting. It reports an estimated queue position when a request is admitted. Each user can have only one queued or processing job. A new link silently replaces that user's job until audio processing starts; after that, new links are rejected until it finishes.
+- For YouTube comparisons, creator-provided, manually reviewed subtitles are preferable when available. They are often found on educational, lecture, news, or organization channels. Choose the `manual` track over `automatic` when possible.
 - Only subtitle tracks matching a language available in the video's audio tracks are offered. Manual subtitles are preferred over automatic subtitles within those languages. If the audio language cannot be verified or no matching subtitle track exists, the bot will not compare mismatched languages.
 - When automatic subtitles are used, the final result warns that they may be inaccurate. WebVTT timestamps and repeated cues are cleaned before comparison.
 - Videos are limited to 60 minutes and downloaded audio files to 500 MB. Temporary working files are deleted after the result files have been sent.
@@ -90,6 +91,7 @@ The SQLite database and TinyASR Chromium profile remain in the Docker volume `bo
 - **WER (Word Error Rate)** measures word-level transcription errors: word substitutions, deletions, and insertions divided by the number of words in the reference subtitles.
 - **CER (Character Error Rate)** uses the same calculation at the character level, divided by the number of characters in the reference subtitles.
 - Lower WER and CER scores mean the transcription is closer to the subtitles. A score of 0% means an exact match.
+- For English, French, Spanish, Portuguese, Russian, German, and Arabic, spoken number, currency, and measurement forms are normalized for comparison while the HTML report preserves the original subtitle and transcript text. Other languages use the existing text comparison.
 
 ## Data and secrets
 

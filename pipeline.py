@@ -266,12 +266,13 @@ def process_video(
     logger.info('Comparing transcript with subtitle reference.')
     if progress_callback is not None:
         progress_callback('Step 4/5: Comparing the transcription with subtitles...')
-    scores = compare_texts(reference, hypothesis)
+    scores = compare_texts(reference, hypothesis, track['language_code'])
     differences, html_path, json_path = write_difference_files(
         output_dir,
         title or 'YouTube video',
         subtitle_cues,
         hypothesis,
+        track['language_code'],
     )
     logger.info(
         'Text comparison complete: WER=%.2f%%, CER=%.2f%%, differing subtitle cues=%d/%d.',

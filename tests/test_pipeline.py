@@ -17,6 +17,7 @@ from pipeline import (
     transcribe_uploaded_audio,
     transcribe_uploaded_video,
 )
+from transcript import compare_texts, write_difference_files
 
 
 class AudioFormatTests(unittest.TestCase):
@@ -362,6 +363,11 @@ class AudioFormatTests(unittest.TestCase):
                     ],
                 ),
                 patch('pipeline.transcribe', side_effect=transcribe_audio) as transcribe,
+                patch('pipeline.compare_texts', wraps=compare_texts) as score_texts,
+                patch(
+                    'pipeline.write_difference_files',
+                    wraps=write_difference_files,
+                ) as save_differences,
                 self.assertLogs('pipeline', level='INFO') as captured,
             ):
                 transcript_callback = (
@@ -370,6 +376,7 @@ class AudioFormatTests(unittest.TestCase):
                 result = process_video(
                     'https://www.youtube.com/watch?v=M8qOjBw2Vo8',
                     {
+                        'language_code': 'en',
                         'model_label': 'English, Russian, Ukrainian',
                         'model_language_code': 'en',
                     },
@@ -385,6 +392,8 @@ class AudioFormatTests(unittest.TestCase):
                 progress_updates.append,
                 transcript_callback=transcript_callback,
             )
+            self.assertEqual(score_texts.call_args.args[-1], 'en')
+            self.assertEqual(save_differences.call_args.args[-1], 'en')
             self.assertEqual(transcript_updates, ['hello'])
             self.assertEqual(result['wer'], 50.0)
             self.assertEqual(result['audio_path'], audio_path)

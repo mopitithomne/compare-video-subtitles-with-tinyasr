@@ -1,7 +1,11 @@
 import html
 import json
+import logging
+import os
 import re
 import unicodedata
+from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 
 import pysrt
@@ -14,6 +18,8 @@ _VTT_TIMESTAMP_RE = re.compile(
 )
 _VTT_INLINE_TIMESTAMP_RE = re.compile(r'<\d{2}:\d{2}:\d{2}\.\d+>')
 _VTT_SHORT_CUE_SECONDS = 0.05
+_NEMO_ITN_LANGUAGES = frozenset({'ar', 'de', 'en', 'es', 'fr', 'pt', 'ru'})
+logger = logging.getLogger(__name__)
 
 
 def _split_words(text):
@@ -53,6 +59,195 @@ def normalize(text):
         for char in text
     )
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def _itn_language(language):
+    if not isinstance(language, str):
+        return None
+    language = language.replace('_', '-').split('-', 1)[0].casefold()
+    return language if language in _NEMO_ITN_LANGUAGES else None
+
+
+@lru_cache(maxsize=2)
+def _inverse_normalizer(language):
+    from nemo_text_processing.inverse_text_normalization.inverse_normalize import (
+        InverseNormalizer,
+    )
+
+    cache_dir = Path(
+        os.environ.get('NEMO_TEXT_CACHE_DIR', 'data/nemo_text_processing')
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    logger.info('Loading NeMo inverse text normalization for %s.', language)
+    return InverseNormalizer(
+        input_case='lower_cased',
+        lang=language,
+        cache_dir=str(cache_dir),
+    )
+
+
+def _prepare_for_inverse_normalization(text):
+    text = text.casefold()
+    prepared = []
+    for index, char in enumerate(text):
+        if not unicodedata.category(char).startswith('P'):
+            prepared.append(char)
+            continue
+        previous = text[index - 1] if index else ''
+        following = text[index + 1] if index + 1 < len(text) else ''
+        if char in '.,٫' and previous.isdigit() and following.isdigit():
+            prepared.append(char)
+        elif char in '.!?':
+            prepared.append(char)
+        elif char in "'’-" and previous.isalpha() and following.isalpha():
+            prepared.append(char)
+        else:
+            prepared.append(' ')
+    return re.sub(r'\s+', ' ', ''.join(prepared)).strip()
+
+
+def _inverse_normalization_chunks(text, normalizer):
+    sentences = normalizer.split_text_into_sentences(text)
+    chunks = []
+    current_sentences = []
+    current_word_count = 0
+    max_words = 400
+    for sentence in sentences:
+        words = sentence.split()
+        if len(words) > max_words:
+            if current_sentences:
+                chunks.append(' '.join(current_sentences))
+                current_sentences = []
+                current_word_count = 0
+            chunks.extend(
+                ' '.join(words[index : index + max_words])
+                for index in range(0, len(words), max_words)
+            )
+        elif current_word_count + len(words) > max_words:
+            chunks.append(' '.join(current_sentences))
+            current_sentences = [sentence]
+            current_word_count = len(words)
+        else:
+            current_sentences.append(sentence)
+            current_word_count += len(words)
+    if current_sentences:
+        chunks.append(' '.join(current_sentences))
+    return chunks
+
+
+def _comparison_words(text, language=None):
+    language = _itn_language(language)
+    if language is not None:
+        normalizer = _inverse_normalizer(language)
+        normalized = ' '.join(
+            normalizer.inverse_normalize(
+                _prepare_for_inverse_normalization(chunk),
+                verbose=False,
+            )
+            for chunk in _inverse_normalization_chunks(text, normalizer)
+        )
+    else:
+        normalized = text
+    return normalize(normalized).split()
+
+
+def _mapped_comparison_words(text, language=None):
+    raw_spans = _word_spans(text)
+    language = _itn_language(language)
+    if language is None:
+        return [
+            (word, index, index + 1)
+            for index, (start, end) in enumerate(raw_spans)
+            for word in _comparison_words(text[start:end])
+        ]
+
+    normalized_words = _comparison_words(text, language)
+    if not raw_spans or not normalized_words:
+        return []
+
+    raw_words = [
+        (word, raw_index)
+        for raw_index, (start, end) in enumerate(raw_spans)
+        for word in normalize(text[start:end]).split()
+    ]
+    raw_tokens = [word for word, _ in raw_words]
+    mapped_words = []
+    raw_cursor = 0
+    normalized_cursor = 0
+
+    def map_unmatched(raw_start, raw_end, normalized_start, normalized_end):
+        if normalized_start == normalized_end:
+            return
+        if raw_start < raw_end:
+            mapped_start = raw_words[raw_start][1]
+            mapped_end = raw_words[raw_end - 1][1] + 1
+        else:
+            mapped_start = raw_words[max(0, raw_start - 1)][1]
+            mapped_end = mapped_start + 1
+        mapped_words.extend(
+            (normalized_words[index], mapped_start, mapped_end)
+            for index in range(normalized_start, normalized_end)
+        )
+
+    window_size = 256
+    while normalized_cursor < len(normalized_words):
+        if raw_cursor == len(raw_words):
+            map_unmatched(
+                raw_cursor,
+                raw_cursor,
+                normalized_cursor,
+                len(normalized_words),
+            )
+            break
+        raw_end = min(raw_cursor + window_size, len(raw_words))
+        normalized_end = min(
+            normalized_cursor + window_size,
+            len(normalized_words),
+        )
+        matcher = SequenceMatcher(
+            None,
+            raw_tokens[raw_cursor:raw_end],
+            normalized_words[normalized_cursor:normalized_end],
+            autojunk=False,
+        )
+        blocks = [
+            block
+            for block in matcher.get_matching_blocks()
+            if block.size
+        ]
+        if not blocks:
+            map_unmatched(
+                raw_cursor,
+                raw_end,
+                normalized_cursor,
+                normalized_end,
+            )
+            raw_cursor = raw_end
+            normalized_cursor = normalized_end
+            continue
+
+        window_raw_start = raw_cursor
+        window_normalized_start = normalized_cursor
+        for block in blocks:
+            raw_match = window_raw_start + block.a
+            normalized_match = window_normalized_start + block.b
+            map_unmatched(
+                raw_cursor,
+                raw_match,
+                normalized_cursor,
+                normalized_match,
+            )
+            mapped_words.extend(
+                (
+                    normalized_words[normalized_match + offset],
+                    raw_words[raw_match + offset][1],
+                    raw_words[raw_match + offset][1] + 1,
+                )
+                for offset in range(block.size)
+            )
+            raw_cursor = raw_match + block.size
+            normalized_cursor = normalized_match + block.size
+    return mapped_words
 
 
 def _timestamp_seconds(timestamp):
@@ -223,9 +418,9 @@ def read_reference(path):
     return path.read_text(encoding='utf-8')
 
 
-def compare_texts(reference, hypothesis):
-    reference = normalize(reference)
-    hypothesis = normalize(hypothesis)
+def compare_texts(reference, hypothesis, language=None):
+    reference = ' '.join(_comparison_words(reference, language))
+    hypothesis = ' '.join(_comparison_words(hypothesis, language))
     if not reference or not hypothesis:
         raise ValueError('Both reference and TinyASR transcript must contain text.')
     return {
@@ -234,7 +429,49 @@ def compare_texts(reference, hypothesis):
     }
 
 
-def compare_subtitle_cues(cues, hypothesis):
+def _raw_word_differences(
+    reference_words,
+    hypothesis_words,
+    reference_raw_count,
+    hypothesis_raw_count,
+):
+    if not reference_words or not hypothesis_words:
+        raise ValueError('Both reference and TinyASR transcript must contain text.')
+    alignment = process_words(
+        ' '.join(word for word, _, _ in reference_words),
+        ' '.join(word for word, _, _ in hypothesis_words),
+    ).alignments[0]
+    reference_states = [set() for _ in range(reference_raw_count)]
+    hypothesis_states = [set() for _ in range(hypothesis_raw_count)]
+    for chunk in alignment:
+        different = chunk.type != 'equal'
+        if chunk.type in {'equal', 'substitute'}:
+            for index in range(chunk.ref_start_idx, chunk.ref_end_idx):
+                _, raw_start, raw_end = reference_words[index]
+                for raw_index in range(raw_start, raw_end):
+                    reference_states[raw_index].add(different)
+            for index in range(chunk.hyp_start_idx, chunk.hyp_end_idx):
+                _, raw_start, raw_end = hypothesis_words[index]
+                for raw_index in range(raw_start, raw_end):
+                    hypothesis_states[raw_index].add(different)
+        elif chunk.type == 'delete':
+            for index in range(chunk.ref_start_idx, chunk.ref_end_idx):
+                _, raw_start, raw_end = reference_words[index]
+                for raw_index in range(raw_start, raw_end):
+                    reference_states[raw_index].add(True)
+        elif chunk.type == 'insert':
+            for index in range(chunk.hyp_start_idx, chunk.hyp_end_idx):
+                _, raw_start, raw_end = hypothesis_words[index]
+                for raw_index in range(raw_start, raw_end):
+                    hypothesis_states[raw_index].add(True)
+    return (
+        alignment,
+        [not states or any(states) for states in reference_states],
+        [not states or any(states) for states in hypothesis_states],
+    )
+
+
+def compare_subtitle_cues(cues, hypothesis, language=None):
     reference_words = [
         (word, cue_index, timestamp)
         for cue_index, cue in enumerate(cues)
@@ -244,9 +481,22 @@ def compare_subtitle_cues(cues, hypothesis):
     if not reference_words or not hypothesis_words:
         raise ValueError('Both reference and TinyASR transcript must contain text.')
 
-    reference = normalize(' '.join(word for word, _, _ in reference_words))
-    normalized_hypothesis = normalize(' '.join(hypothesis_words))
-    alignment = process_words(reference, normalized_hypothesis).alignments[0]
+    mapped_reference_words = _mapped_comparison_words(
+        ' '.join(word for word, _, _ in reference_words),
+        language,
+    )
+    mapped_hypothesis_words = _mapped_comparison_words(
+        ' '.join(hypothesis_words),
+        language,
+    )
+    if not mapped_reference_words or not mapped_hypothesis_words:
+        raise ValueError('Normalization removed all comparison text.')
+    alignment, _, hypothesis_differences = _raw_word_differences(
+        mapped_reference_words,
+        mapped_hypothesis_words,
+        len(reference_words),
+        len(hypothesis_words),
+    )
     rows = [
         {
             'timestamp': None,
@@ -256,6 +506,8 @@ def compare_subtitle_cues(cues, hypothesis):
         }
         for cue in cues
     ]
+    hypothesis_cues = [None] * len(hypothesis_words)
+    missing_reference_words = set()
 
     def append_word(cue_index, timestamp, word, different=False):
         row = rows[cue_index]
@@ -266,37 +518,57 @@ def compare_subtitle_cues(cues, hypothesis):
 
     for chunk in alignment:
         if chunk.type in {'equal', 'substitute'}:
-            different = chunk.type == 'substitute'
-            for ref_index, hyp_index in zip(
-                range(chunk.ref_start_idx, chunk.ref_end_idx),
-                range(chunk.hyp_start_idx, chunk.hyp_end_idx),
-            ):
-                _, cue_index, timestamp = reference_words[ref_index]
-                append_word(
-                    cue_index,
-                    timestamp,
-                    hypothesis_words[hyp_index],
-                    different,
+            hyp_indices = range(chunk.hyp_start_idx, chunk.hyp_end_idx)
+            for offset, hyp_index in enumerate(hyp_indices):
+                ref_index = min(
+                    chunk.ref_start_idx + offset,
+                    chunk.ref_end_idx - 1,
                 )
+                _, cue_index, timestamp = reference_words[
+                    mapped_reference_words[ref_index][1]
+                ]
+                _, raw_start, raw_end = mapped_hypothesis_words[hyp_index]
+                for raw_index in range(raw_start, raw_end):
+                    if hypothesis_cues[raw_index] is None:
+                        hypothesis_cues[raw_index] = (cue_index, timestamp)
         elif chunk.type == 'delete':
             for ref_index in range(chunk.ref_start_idx, chunk.ref_end_idx):
-                source_word, cue_index, timestamp = reference_words[ref_index]
-                append_word(
-                    cue_index,
-                    timestamp,
-                    f'[missing: {source_word}]',
-                    True,
-                )
+                _, raw_start, raw_end = mapped_reference_words[ref_index]
+                missing_reference_words.update(range(raw_start, raw_end))
         elif chunk.type == 'insert':
             ref_index = max(0, chunk.ref_start_idx - 1)
-            _, cue_index, timestamp = reference_words[ref_index]
+            _, cue_index, timestamp = reference_words[
+                mapped_reference_words[ref_index][1]
+            ]
             for hyp_index in range(chunk.hyp_start_idx, chunk.hyp_end_idx):
-                append_word(
-                    cue_index,
-                    timestamp,
-                    hypothesis_words[hyp_index],
-                    True,
-                )
+                _, raw_start, raw_end = mapped_hypothesis_words[hyp_index]
+                for raw_index in range(raw_start, raw_end):
+                    if hypothesis_cues[raw_index] is None:
+                        hypothesis_cues[raw_index] = (cue_index, timestamp)
+
+    last_cue = (0, cues[0]['timestamp'])
+    for raw_index, word in enumerate(hypothesis_words):
+        location = hypothesis_cues[raw_index]
+        if location is None:
+            location = last_cue
+            hypothesis_differences[raw_index] = True
+        last_cue = location
+        cue_index, timestamp = location
+        append_word(
+            cue_index,
+            timestamp,
+            word,
+            hypothesis_differences[raw_index],
+        )
+
+    for raw_index in sorted(missing_reference_words):
+        source_word, cue_index, timestamp = reference_words[raw_index]
+        append_word(
+            cue_index,
+            timestamp,
+            f'[missing: {source_word}]',
+            True,
+        )
 
     return [
         {
@@ -373,7 +645,127 @@ def _single_character_change_ranges(source_word, hypothesis_word):
     return source_change, hypothesis_change
 
 
-def align_transcript_texts(source_text, hypothesis):
+def _render_aligned_side(text, spans, differences, character_changes):
+    rows = []
+    parts = []
+    cursor = 0
+    row_bytes = 0
+    row_words = 0
+
+    def finish_row():
+        nonlocal parts, row_bytes, row_words
+        if row_words:
+            rows.append(parts)
+        parts = []
+        row_bytes = 0
+        row_words = 0
+
+    for index, (start, end) in enumerate(spans):
+        prefix = text[cursor:start]
+        word = text[start:end]
+        part_bytes = len(prefix.encode('utf-8')) + len(word.encode('utf-8'))
+        if row_words and (
+            row_words >= 100 or row_bytes + part_bytes > 6_000
+        ):
+            finish_row()
+
+        _append_alignment_part(parts, prefix, False)
+        _append_alignment_part(
+            parts,
+            word,
+            differences[index],
+            character_changes[index],
+        )
+        cursor = end
+        row_bytes += part_bytes
+        row_words += 1
+
+    tail = text[cursor:]
+    if tail:
+        _append_alignment_part(parts, tail, False)
+    finish_row()
+    return rows
+
+
+def _align_normalized_texts(source_text, hypothesis, language):
+    source_spans = _word_spans(source_text)
+    hypothesis_spans = _word_spans(hypothesis)
+    source_words = [source_text[start:end] for start, end in source_spans]
+    hypothesis_words = [hypothesis[start:end] for start, end in hypothesis_spans]
+    if not source_words or not hypothesis_words:
+        raise ValueError('Both reference and TinyASR transcript must contain text.')
+
+    mapped_source = _mapped_comparison_words(source_text, language)
+    mapped_hypothesis = _mapped_comparison_words(hypothesis, language)
+    if not mapped_source or not mapped_hypothesis:
+        raise ValueError('Normalization removed all comparison text.')
+    _, source_differences, hypothesis_differences = _raw_word_differences(
+        mapped_source,
+        mapped_hypothesis,
+        len(source_words),
+        len(hypothesis_words),
+    )
+
+    source_character_changes = [None] * len(source_words)
+    hypothesis_character_changes = [None] * len(hypothesis_words)
+    raw_alignment = process_words(
+        normalize(' '.join(source_words)),
+        normalize(' '.join(hypothesis_words)),
+    ).alignments[0]
+    for chunk in raw_alignment:
+        if chunk.type == 'equal':
+            continue
+        pair_count = max(
+            chunk.ref_end_idx - chunk.ref_start_idx,
+            chunk.hyp_end_idx - chunk.hyp_start_idx,
+        )
+        for offset in range(pair_count):
+            source_index = chunk.ref_start_idx + offset
+            hypothesis_index = chunk.hyp_start_idx + offset
+            if (
+                source_index >= chunk.ref_end_idx
+                or hypothesis_index >= chunk.hyp_end_idx
+                or not source_differences[source_index]
+                or not hypothesis_differences[hypothesis_index]
+            ):
+                continue
+            character_changes = _single_character_change_ranges(
+                source_words[source_index],
+                hypothesis_words[hypothesis_index],
+            )
+            if character_changes is not None:
+                source_character_changes[source_index] = character_changes[0]
+                hypothesis_character_changes[hypothesis_index] = character_changes[1]
+
+    source_rows = _render_aligned_side(
+        source_text,
+        source_spans,
+        source_differences,
+        source_character_changes,
+    )
+    hypothesis_rows = _render_aligned_side(
+        hypothesis,
+        hypothesis_spans,
+        hypothesis_differences,
+        hypothesis_character_changes,
+    )
+    return [
+        {
+            'source_parts': (
+                source_rows[index] if index < len(source_rows) else []
+            ),
+            'tinyasr_parts': (
+                hypothesis_rows[index] if index < len(hypothesis_rows) else []
+            ),
+        }
+        for index in range(max(len(source_rows), len(hypothesis_rows)))
+    ]
+
+
+def align_transcript_texts(source_text, hypothesis, language=None):
+    if _itn_language(language) is not None:
+        return _align_normalized_texts(source_text, hypothesis, language)
+
     source_spans = _word_spans(source_text)
     hypothesis_spans = _word_spans(hypothesis)
     source_words = [source_text[start:end] for start, end in source_spans]
@@ -510,9 +902,9 @@ def _render_alignment_parts(parts, css_class):
     return ''.join(rendered)
 
 
-def write_difference_files(output_dir, title, cues, hypothesis):
+def write_difference_files(output_dir, title, cues, hypothesis, language=None):
     output_dir = Path(output_dir)
-    differences = compare_subtitle_cues(cues, hypothesis)
+    differences = compare_subtitle_cues(cues, hypothesis, language)
     json_path = output_dir / 'subtitle-differences.json'
     json_path.write_text(
         json.dumps(differences, ensure_ascii=False, indent=2) + '\n',
@@ -520,7 +912,7 @@ def write_difference_files(output_dir, title, cues, hypothesis):
     )
 
     source_text = ' '.join(cue['text'] for cue in cues)
-    aligned_rows = align_transcript_texts(source_text, hypothesis)
+    aligned_rows = align_transcript_texts(source_text, hypothesis, language)
     alignment_path = output_dir / 'subtitle-alignment.json'
     alignment_path.write_text(
         json.dumps(aligned_rows, ensure_ascii=False, indent=2) + '\n',

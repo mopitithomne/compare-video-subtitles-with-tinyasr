@@ -109,11 +109,33 @@ class LocalBotTests(unittest.TestCase):
         self.assertIn('Word Error Rate', help_text)
         self.assertIn('Character Error Rate', help_text)
         self.assertIn('YouTube video link', help_text)
-        self.assertIn('video directly in Telegram', help_text)
+        self.assertIn('voice message, audio or video directly', help_text)
         self.assertIn('detects the spoken language automatically', help_text)
-        self.assertIn('20 MB', help_text)
+        self.assertIn('creator-provided, manually reviewed subtitles', help_text)
+        self.assertIn('educational, lecture, news, or organization channels', help_text)
+        self.assertIn('channel type alone does not guarantee accuracy', help_text)
+        self.assertIn('"manual" subtitle track over "automatic"', help_text)
         self.assertIn('/reports', help_text)
         self.assertNotIn('/id', help_text)
+
+    def test_start_does_not_explain_wer_or_cer(self):
+        update = {
+            'update_id': 829,
+            'message': {
+                'from': {'id': 42},
+                'chat': {'id': 42},
+                'text': '/start',
+            },
+        }
+        with patch('app._send_message') as send_message:
+            bot_app._handle_update(update)
+
+        start_text = send_message.call_args.args[1]
+        self.assertIn('Send either:', start_text)
+        self.assertNotIn('Word Error Rate', start_text)
+        self.assertNotIn('Character Error Rate', start_text)
+        self.assertNotIn('WER (', start_text)
+        self.assertNotIn('CER (', start_text)
 
     def test_language_keyboard_source_labels_are_english(self):
         keyboard = bot_app._language_keyboard(
@@ -219,7 +241,7 @@ class LocalBotTests(unittest.TestCase):
         answer_callback.assert_called_once_with('approve-user', 'Access approved.')
         approval_message.assert_called_once_with(
             321,
-            'Your access has been approved. You can now use the bot.',
+            'Your access has been approved. Send /start to start using the bot.',
         )
 
         with (
@@ -239,11 +261,106 @@ class LocalBotTests(unittest.TestCase):
 
         self.assertEqual(self.store.active_jobs()[0]['status'], 'discovering')
         self.assertIn('added to the queue', accepted_message.call_args.args[1])
-        self.assertIn('Your position is 1/1', accepted_message.call_args.args[1])
+        self.assertNotIn('Queue:', accepted_message.call_args.args[1])
         accepted_submit.assert_called_once_with(
             bot_app._discover_job,
             self.store.active_jobs()[0]['job_id'],
         )
+
+    def test_owner_can_list_approved_users_and_remove_access(self):
+        self.store.request_user_access(321, 321, 'Alex', 'Example', 'alex_example')
+        self.store.approve_user(321)
+        list_update = {
+            'update_id': 830,
+            'message': {
+                'from': {'id': 42},
+                'chat': {'id': 42},
+                'text': '/users',
+            },
+        }
+        with patch('app._send_message') as send_message:
+            bot_app._handle_update(list_update)
+
+        send_message.assert_called_once()
+        self.assertIn('Approved users', send_message.call_args.args[1])
+        self.assertIn('Alex Example', send_message.call_args.args[1])
+        self.assertIn('@alex_example', send_message.call_args.args[1])
+        self.assertIn('ID: 321', send_message.call_args.args[1])
+        remove_button = send_message.call_args.args[2]['inline_keyboard'][0][0]
+        self.assertEqual(remove_button['text'], 'Remove Alex Example')
+        self.assertEqual(remove_button['callback_data'], 'remove_user|321')
+
+        callback = {
+            'id': 'remove-approved-user',
+            'data': 'remove_user|321',
+            'from': {'id': 42},
+            'message': {'chat': {'id': 42}},
+        }
+        with (
+            patch('app._answer_callback') as answer_callback,
+            patch('app._send_message') as send_message,
+        ):
+            bot_app._handle_callback_query(callback)
+
+        self.assertFalse(self.store.user_is_approved(321))
+        answer_callback.assert_called_once_with(
+            'remove-approved-user',
+            'User access removed.',
+        )
+        send_message.assert_any_call(
+            321,
+            'Your access to this bot has been revoked. Contact the owner if you need access again.',
+        )
+        self.assertEqual(
+            send_message.call_args_list[-1].args[1],
+            'There are no approved users.',
+        )
+        access_request = self.store.request_user_access(
+            321,
+            321,
+            'Alex',
+            'Example',
+            'alex_example',
+        )
+        self.assertEqual(access_request, {'status': 'pending', 'notify_owner': True})
+
+    def test_non_owner_cannot_list_or_remove_approved_users(self):
+        self._approve_user(321)
+        with patch('app._send_message') as send_message:
+            bot_app._handle_update(
+                {
+                    'update_id': 831,
+                    'message': {
+                        'from': {'id': 321},
+                        'chat': {'id': 321},
+                        'text': '/users',
+                    },
+                }
+            )
+
+        send_message.assert_called_once_with(
+            321,
+            'Only the owner can manage approved users.',
+        )
+
+        callback = {
+            'id': 'unauthorized-remove',
+            'data': 'remove_user|321',
+            'from': {'id': 777},
+            'message': {'chat': {'id': 777}},
+        }
+        with (
+            patch('app._answer_callback') as answer_callback,
+            patch('app._send_message') as send_message,
+        ):
+            bot_app._handle_callback_query(callback)
+
+        self.assertTrue(self.store.user_is_approved(321))
+        answer_callback.assert_called_once_with(
+            'unauthorized-remove',
+            'Only the owner can remove access from the private chat.',
+        )
+        send_message.assert_not_called()
 
     def test_telegram_video_upload_is_queued_for_transcription(self):
         update = {
@@ -281,7 +398,7 @@ class LocalBotTests(unittest.TestCase):
             'detect the spoken language automatically',
             send_progress.call_args.args[1],
         )
-        self.assertIn('Your position is 1/1', send_progress.call_args.args[1])
+        self.assertNotIn('Queue:', send_progress.call_args.args[1])
 
     def test_telegram_voice_and_audio_uploads_are_queued_for_transcription(self):
         self._approve_user(43)
@@ -801,6 +918,10 @@ class LocalBotTests(unittest.TestCase):
                 'processing': 1,
             },
         )
+        self.assertEqual(
+            bot_app._queue_status_message(second_job_id),
+            '2/2\n\n',
+        )
         self.assertIsNone(self.store.queue_position(language_job_id))
         self.store.update_job(first_job_id, status='completed')
         self.assertEqual(
@@ -812,6 +933,7 @@ class LocalBotTests(unittest.TestCase):
                 'processing': 0,
             },
         )
+        self.assertEqual(bot_app._queue_status_message(second_job_id), '')
 
     def test_full_queue_sends_a_clear_message(self):
         for index in range(4):
@@ -962,7 +1084,10 @@ class LocalBotTests(unittest.TestCase):
             progress_callback = submit_job.call_args.args[2]
             self.assertTrue(progress_callback('Step 2/4: Preparing TinyASR...'))
             edit_message.assert_called_with(42, 123, 'Step 2/4: Preparing TinyASR...')
-            self.assertIn('Your position is 1/1', edit_message.call_args_list[0].args[2])
+            self.assertNotIn(
+                'Queue:',
+                edit_message.call_args_list[0].args[2],
+            )
 
         job = self.store.get_job(job_id)
         self.assertEqual(job['status'], 'queued')
@@ -1069,6 +1194,10 @@ class LocalBotTests(unittest.TestCase):
                 saved_report = self.store.get_report(report_id)
                 self.assertEqual(saved_report['video_id'], 'dQw4w9WgXcQ')
                 self.assertEqual(saved_report['track'], track)
+                self.assertIn('WER: 10.00%', saved_report['summary'])
+                self.assertIn('CER: 5.00%', saved_report['summary'])
+                self.assertNotIn('Word Error Rate', saved_report['summary'])
+                self.assertNotIn('Character Error Rate', saved_report['summary'])
                 self.assertTrue(
                     all(
                         (Path(temp_dir) / 'saved-reports' / report_id / filename).is_file()

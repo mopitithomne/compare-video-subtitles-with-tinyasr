@@ -62,6 +62,142 @@ class TranscriptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_texts('', 'hello')
 
+    def test_language_aware_normalization_matches_currency_and_units(self):
+        self.assertEqual(
+            compare_texts('cinq euros', '5 €', 'fr'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('cent grammes', '100 g', 'fr'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertEqual(
+            compare_texts('five dollars', '$5', 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        long_reference = ' '.join(['hello'] * 401 + ['five dollars'])
+        long_hypothesis = ' '.join(['hello'] * 401 + ['$5'])
+        self.assertEqual(
+            compare_texts(long_reference, long_hypothesis, 'en'),
+            {'wer': 0, 'cer': 0},
+        )
+        self.assertGreater(compare_texts('100 g', '100 kg', 'en')['wer'], 0)
+        self.assertGreater(compare_texts('five dollars', '$5', 'it')['wer'], 0)
+
+    def test_normalized_report_keeps_raw_text_without_highlighting_equivalences(self):
+        cues = [
+            {
+                'timestamp': '00:00:01.000',
+                'text': 'cinq euros',
+                'words': [
+                    ('cinq', '00:00:01.000'),
+                    ('euros', '00:00:01.000'),
+                ],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            differences, html_path, _ = write_difference_files(
+                temp_dir,
+                'Currency',
+                cues,
+                '5 €',
+                'fr',
+            )
+            report = html_path.read_text(encoding='utf-8')
+            aligned_rows = align_transcript_texts('cinq euros', '5 €', 'fr')
+
+        self.assertEqual(differences, [])
+        self.assertIn('<td><pre class="transcript">cinq euros</pre>', report)
+        self.assertIn('<td><pre class="transcript">5 €</pre>', report)
+        self.assertNotIn('<span class="source-difference">', report)
+        self.assertNotIn('<span class="tinyasr-difference">', report)
+        self.assertEqual(
+            ''.join(
+                part['text']
+                for row in aligned_rows
+                for part in row['source_parts']
+            ),
+            'cinq euros',
+        )
+        self.assertEqual(
+            ''.join(
+                part['text']
+                for row in aligned_rows
+                for part in row['tinyasr_parts']
+            ),
+            '5 €',
+        )
+        self.assertFalse(any(
+            part['different']
+            for row in aligned_rows
+            for side in ('source_parts', 'tinyasr_parts')
+            for part in row[side]
+        ))
+
+    def test_normalization_alignment_handles_multiword_number_conversion(self):
+        source_text = 'one hundred grams'
+        tinyasr_text = '100 g'
+        cues = [
+            {
+                'timestamp': '00:00:01.000',
+                'text': source_text,
+                'words': [
+                    ('one', '00:00:01.000'),
+                    ('hundred', '00:00:01.000'),
+                    ('grams', '00:00:01.000'),
+                ],
+            }
+        ]
+        rows = align_transcript_texts(source_text, tinyasr_text, 'en')
+
+        self.assertEqual(compare_subtitle_cues(cues, tinyasr_text, 'en'), [])
+        self.assertEqual(
+            ''.join(
+                part['text']
+                for row in rows
+                for part in row['source_parts']
+            ),
+            source_text,
+        )
+        self.assertEqual(
+            ''.join(
+                part['text']
+                for row in rows
+                for part in row['tinyasr_parts']
+            ),
+            tinyasr_text,
+        )
+        self.assertFalse(any(
+            part['different']
+            for row in rows
+            for side in ('source_parts', 'tinyasr_parts')
+            for part in row[side]
+        ))
+
+        currency_rows = align_transcript_texts('five dollars', '$5', 'en')
+        self.assertEqual(
+            ''.join(
+                part['text']
+                for row in currency_rows
+                for part in row['source_parts']
+            ),
+            'five dollars',
+        )
+        self.assertEqual(
+            ''.join(
+                part['text']
+                for row in currency_rows
+                for part in row['tinyasr_parts']
+            ),
+            '$5',
+        )
+        self.assertFalse(any(
+            part['different']
+            for row in currency_rows
+            for side in ('source_parts', 'tinyasr_parts')
+            for part in row[side]
+        ))
+
     def test_comparison_uses_inline_vtt_word_timestamps(self):
         content = (
             'WEBVTT\n\n'

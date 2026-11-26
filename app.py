@@ -539,15 +539,20 @@ class JobStore:
                     status = 'pending'
                     notify_owner = True
                 else:
-                    status = row['status']
+                    was_revoked = row['status'] == 'revoked'
+                    status = 'pending' if was_revoked else row['status']
                     notify_owner = (
-                        status == 'pending' and row['owner_notified_at'] is None
+                        was_revoked
+                        or (status == 'pending' and row['owner_notified_at'] is None)
                     )
                     self.connection.execute(
                         '''
                         UPDATE user_access
                         SET chat_id = ?, first_name = ?, last_name = ?,
-                            username = ?, updated_at = ?
+                            username = ?, status = ?, owner_notified_at =
+                                CASE WHEN ? THEN NULL ELSE owner_notified_at END,
+                            approved_at = CASE WHEN ? THEN NULL ELSE approved_at END,
+                            updated_at = ?
                         WHERE user_id = ?
                         ''',
                         (
@@ -555,6 +560,9 @@ class JobStore:
                             first_name,
                             last_name,
                             username,
+                            status,
+                            was_revoked,
+                            was_revoked,
                             now,
                             user_id,
                         ),
@@ -565,6 +573,51 @@ class JobStore:
                     self.connection.rollback()
                 raise
         return {'status': status, 'notify_owner': notify_owner}
+
+    def list_approved_users(self):
+        with self.lock:
+            rows = self.connection.execute(
+                '''
+                SELECT user_id, chat_id, first_name, last_name, username
+                FROM user_access
+                WHERE status = 'approved'
+                ORDER BY first_name COLLATE NOCASE, last_name COLLATE NOCASE, user_id
+                '''
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_user_access(self, user_id):
+        now = _now()
+        with self.lock:
+            self.connection.execute('BEGIN IMMEDIATE')
+            try:
+                row = self.connection.execute(
+                    '''
+                    SELECT user_id, chat_id, first_name, last_name, username
+                    FROM user_access
+                    WHERE user_id = ? AND status = 'approved'
+                    ''',
+                    (user_id,),
+                ).fetchone()
+                if row is None:
+                    self.connection.commit()
+                    return None
+                self.connection.execute(
+                    '''
+                    UPDATE user_access
+                    SET status = 'revoked', approved_at = NULL, updated_at = ?
+                    WHERE user_id = ? AND status = 'approved'
+                    ''',
+                    (now, user_id),
+                )
+                self.connection.commit()
+            except Exception:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+        revoked_user = dict(row)
+        revoked_user['status'] = 'revoked'
+        return revoked_user
 
     def mark_access_request_notified(self, user_id):
         now = _now()
@@ -591,7 +644,7 @@ class JobStore:
                     ''',
                     (user_id,),
                 ).fetchone()
-                if row is None:
+                if row is None or row['status'] == 'revoked':
                     self.connection.commit()
                     return None
                 if row['status'] != 'approved':
@@ -687,17 +740,9 @@ def _send_message(chat_id, text, reply_markup=None):
 
 def _queue_status_message(job_id):
     status = _get_store().queue_position(job_id)
-    if status is None:
-        return 'Queue position is no longer available; your request may have started.'
-    request_label = 'media request' if status['active'] == 1 else 'media requests'
-    processing_label = 'request is' if status['processing'] == 1 else 'requests are'
-    ahead_label = 'request' if status['ahead'] == 1 else 'requests'
-    return (
-        f"Queue estimate: {status['active']} active {request_label}; "
-        f"{status['processing']} {processing_label} processing. "
-        f"Your position is {status['position']}/{status['active']} "
-        f"({status['ahead']} {ahead_label} ahead)."
-    )
+    if status is None or status['active'] <= 1:
+        return ''
+    return f"{status['position']}/{status['active']}\n\n"
 
 
 def _transcript_draft_callback(chat_id):
@@ -1373,7 +1418,7 @@ def _discover_job(job_id):
                 job['chat_id'],
                 f"Only one compatible subtitle language is available: "
                 f"{track['language_name']}.\n\n"
-                f"{_queue_status_message(job_id)}\n\n"
+                f"{_queue_status_message(job_id)}"
                 'Step 1/5: Preparing to download audio and subtitles...',
             )
         finally:
@@ -1437,8 +1482,8 @@ def _process_job(job_id, progress_callback=None):
             result_message = (
                 f'Comparison complete: {display_title}\n'
                 f"Subtitle language: {track['language_name']} ({source_label})\n"
-                f"WER (Word Error Rate): {result['wer']:.2f}%\n"
-                f"CER (Character Error Rate): {result['cer']:.2f}%\n"
+                f"WER: {result['wer']:.2f}%\n"
+                f"CER: {result['cer']:.2f}%\n"
                 f"Differing subtitle cues: {result['difference_count']} / "
                 f"{result['subtitle_cue_count']}\n"
             )
@@ -1711,7 +1756,7 @@ def _queue_telegram_media(media, media_type, update_id, user_id, chat_id):
     try:
         progress_callback = _send_progress_message(
             chat_id,
-            f'{_queue_status_message(job_id)}\n\n'
+            f'{_queue_status_message(job_id)}'
             f'{media_label.capitalize()} received and queued. TinyASR will detect '
             'the spoken language automatically and send the transcription here.',
         )
@@ -1723,22 +1768,28 @@ def _queue_telegram_video(video, update_id, user_id, chat_id):
     _queue_telegram_media(video, 'video', update_id, user_id, chat_id)
 
 
-def _send_help(chat_id):
-    _send_message(
-        chat_id,
+def _send_help(chat_id, include_metrics=True):
+    help_text = (
         'Send either:\n'
-        '- A YouTube video link to compare its subtitles with TinyASR, or\n'
-        '- A video directly in Telegram, a voice message, or an audio file for transcription.\n'
-        'TinyASR detects the spoken language automatically. Telegram uploads must '
-        'be 20 MB or smaller and no longer than 60 minutes.\n\n'
-
-        'WER (Word Error Rate) is the number of word substitutions, deletions, '
-        'and insertions divided by the number of words in the subtitles.\n'
-        'CER (Character Error Rate) uses the same calculation at the character '
-        'level, divided by the number of characters in the subtitles.\n'
-        'Lower scores indicate a closer match; 0% means an exact match.\n\n'
-        'Use /reports to view your saved reports.\n\n'
+        '- A YouTube video link to compare its subtitles with TinyASR\n'
+        '- A voice message, audio or video directly\n\n'
+        'TinyASR detects the spoken language automatically.\n\n'
+        'For YouTube comparisons, choose videos with creator-provided, manually '
+        'reviewed subtitles when possible. These are often found on educational, '
+        'lecture, news, or organization channels. Prefer the "manual" subtitle track over "automatic"; '
+        'automatic captions may contain more errors.\n\n'
     )
+    if include_metrics:
+        help_text += (
+            'WER (Word Error Rate) is the number of word substitutions, deletions, '
+            'and insertions divided by the number of words in the subtitles.\n'
+            'CER (Character Error Rate) uses the same calculation at the character '
+            'level, divided by the number of characters in the subtitles.\n'
+            'Lower scores indicate a closer match; 0% means an exact match.\n\n'
+        )
+    help_text += 'Use /reports to view your saved reports.\n\n'
+    'Owner-only: use /users to view approved users and remove their access.\n\n'
+    _send_message(chat_id, help_text)
 
 
 def _send_reports(chat_id, user_id):
@@ -1765,6 +1816,48 @@ def _send_reports(chat_id, user_id):
         '\n'.join(lines),
         {'inline_keyboard': buttons},
     )
+
+
+def _send_allowed_users(chat_id):
+    users = _get_store().list_approved_users()
+    if not users:
+        _send_message(chat_id, 'There are no approved users.')
+        return
+
+    for offset in range(0, len(users), 20):
+        user_batch = users[offset:offset + 20]
+        lines = [
+            f'Approved users ({offset + 1}-{offset + len(user_batch)} of {len(users)}):'
+        ]
+        buttons = []
+        for approved_user in user_batch:
+            name_parts = [
+                str(part).replace('\n', ' ').replace('\r', ' ').strip()
+                for part in (
+                    approved_user['first_name'],
+                    approved_user['last_name'],
+                )
+                if part
+            ]
+            display_name = ' '.join(name_parts) or f"User {approved_user['user_id']}"
+            username = approved_user['username']
+            if username:
+                username_label = str(username).replace('\n', ' ').replace('\r', ' ')
+                username_label = f'@{username_label}'
+            else:
+                username_label = 'No username'
+            lines.append(
+                f"{display_name} | {username_label} | ID: {approved_user['user_id']}"
+            )
+            buttons.append([{
+                'text': f'Remove {display_name[:56]}',
+                'callback_data': f"remove_user|{approved_user['user_id']}",
+            }])
+        _send_message(
+            chat_id,
+            '\n'.join(lines),
+            {'inline_keyboard': buttons},
+        )
 
 
 def _send_existing_report(chat_id, user_id, video_id, report):
@@ -1859,11 +1952,24 @@ def _handle_message(message, update_id):
 
     words = text.strip().split(maxsplit=1)
     command = words[0].split('@', 1)[0].casefold() if words else ''
-    if command in {'/start', '/help'}:
+    if command == '/start':
+        _send_help(chat_id, include_metrics=False)
+        return
+    if command == '/help':
         _send_help(chat_id)
         return
     if command == '/reports':
         _send_reports(chat_id, user_id)
+        return
+    if command == '/users':
+        owner_id = _owner_chat_id()
+        if user_id != owner_id:
+            _send_message(chat_id, 'Only the owner can manage approved users.')
+            return
+        if chat_id != owner_id:
+            _send_message(chat_id, 'Use /users in a private chat with the bot.')
+            return
+        _send_allowed_users(chat_id)
         return
 
     youtube_url = _youtube_url_from_text(text, message.get('entities'))
@@ -1915,7 +2021,7 @@ def _handle_message(message, update_id):
     try:
         _send_message(
             chat_id,
-            f"{_queue_status_message(job_id)}\n"
+            f'{_queue_status_message(job_id)}'
             'Video received and added to the queue. The bot processes one video at a time.',
         )
     finally:
@@ -2015,6 +2121,11 @@ def _handle_callback_query(callback, update_id=None):
         if isinstance(callback_data, str)
         else None
     )
+    remove_user_match = (
+        re.fullmatch(r'remove_user\|([1-9]\d{0,19})', callback_data)
+        if isinstance(callback_data, str)
+        else None
+    )
     if (
         not isinstance(callback_id, str)
         or not isinstance(message, dict)
@@ -2025,6 +2136,7 @@ def _handle_callback_query(callback, update_id=None):
             or details_match
             or rerun_match
             or access_match
+            or remove_user_match
         )
     ):
         if isinstance(callback_id, str):
@@ -2052,8 +2164,38 @@ def _handle_callback_query(callback, update_id=None):
         _answer_callback(callback_id, 'Access approved.')
         _send_message(
             approved_user['chat_id'],
-            'Your access has been approved. You can now use the bot.',
+            'Your access has been approved. Send /start to start using the bot.',
         )
+        return
+
+    if remove_user_match:
+        owner_id = _owner_chat_id()
+        if user_id != owner_id or chat_id != owner_id:
+            _answer_callback(
+                callback_id,
+                'Only the owner can remove access from the private chat.',
+            )
+            return
+        target_user_id = int(remove_user_match.group(1))
+        if target_user_id == owner_id:
+            _answer_callback(callback_id, 'The owner access cannot be removed.')
+            return
+        revoked_user = _get_store().revoke_user_access(target_user_id)
+        if revoked_user is None:
+            _answer_callback(callback_id, 'This user is no longer approved.')
+            return
+        _answer_callback(callback_id, 'User access removed.')
+        try:
+            _send_message(
+                revoked_user['chat_id'],
+                'Your access to this bot has been revoked. Contact the owner if you need access again.',
+            )
+        except RuntimeError:
+            logger.exception(
+                'Could not notify user %s that their access was revoked.',
+                target_user_id,
+            )
+        _send_allowed_users(chat_id)
         return
 
     if report_match or details_match:
@@ -2099,7 +2241,7 @@ def _handle_callback_query(callback, update_id=None):
             _answer_callback(callback_id, 'Starting a new comparison.')
             _send_message(
                 chat_id,
-                f"{_queue_status_message(job_id)}\n"
+                f'{_queue_status_message(job_id)}'
                 'Video received and added to the queue. The bot processes one video at a time.',
             )
         finally:
@@ -2120,7 +2262,7 @@ def _handle_callback_query(callback, update_id=None):
             progress_callback = _start_progress_message(
                 chat_id,
                 message.get('message_id'),
-                f"{_queue_status_message(job_id)}\n"
+                f'{_queue_status_message(job_id)}'
                 'Language selected. Preparing the audio and subtitle download...',
             )
         finally:

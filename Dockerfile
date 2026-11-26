@@ -5,6 +5,7 @@ ENV PATH="/root/.deno/bin:${PATH}"
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     ffmpeg \
